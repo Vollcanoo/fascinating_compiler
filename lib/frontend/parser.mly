@@ -1,7 +1,12 @@
-/** Yacc parser for ToyC */
+
 
 %{
 open Ast
+
+(* Decl 在顶层与语句中语法相同，先解析为 decl_kind 再分别构造 AST *)
+type decl_kind =
+  | DConst of string * exp
+  | DVar of string * exp
 
 let parse_error _ : unit = failwith "Parse error"
 %}
@@ -10,7 +15,7 @@ let parse_error _ : unit = failwith "Parse error"
 %token <string> ID
 %token INT CONST VOID
 %token IF ELSE WHILE BREAK CONTINUE RETURN
-%token PLUS MINUS TIMES DIVIDE MOD
+%token ADD SUB MUL DIV MOD
 %token LT GT LE GE EQ NE
 %token AND OR NOT
 %token ASSIGN
@@ -21,38 +26,66 @@ let parse_error _ : unit = failwith "Parse error"
 %nonassoc ELSE
 %left OR
 %left AND
-%left LT GT LE GE EQ NE
-%left PLUS MINUS
-%left TIMES DIVIDE MOD
-%right NOT UMINUS UPLUS
+%nonassoc LT GT LE GE EQ NE
+%left ADD SUB
+%left MUL DIV MOD
+%right NOT UMINUS UADD
 
 %start comp_unit
 %type <Ast.comp_unit> comp_unit
+%type <decl_kind> decl
+%type <string * Ast.exp> const_decl
+%type <string * Ast.exp> var_decl
+%type <Ast.func_def> func_def
+%type <string> param
+%type <Ast.block> block
+%type <Ast.stmt> stmt
+%type <Ast.exp> expr
+%type <Ast.exp> l_or_expr
+%type <Ast.exp> l_and_expr
+%type <Ast.exp> rel_expr
+%type <Ast.exp> add_expr
+%type <Ast.exp> mul_expr
+%type <Ast.exp> unary_expr
+%type <Ast.exp> primary_expr
 
 %%
 
 comp_unit:
-  | top_levels EOF { $1 }
+  | comp_unit_item comp_unit_tail EOF { $1 :: $2 }
 ;
 
-top_levels:
+comp_unit_tail:
   | { [] }
-  | top_level top_levels { $1 :: $2 }
+  | comp_unit_item comp_unit_tail { $1 :: $2 }
 ;
 
-top_level:
-  | decl { failwith "TODO: parse global declaration" }
-  | func_def { failwith "TODO: parse function definition" }
+comp_unit_item:
+  | decl
+    { match $1 with
+      | DConst (name, e) -> GlobalConstDecl (name, e)
+      | DVar (name, e) -> GlobalVarDecl (name, e) }
+  | func_def { FuncDef $1 }
 ;
 
 decl:
-  | CONST INT ID ASSIGN expr SEMICOLON { failwith "TODO: parse const declaration" }
-  | INT ID ASSIGN expr SEMICOLON { failwith "TODO: parse var declaration" }
+  | const_decl { let (n, e) = $1 in DConst (n, e) }
+  | var_decl { let (n, e) = $1 in DVar (n, e) }
+;
+
+const_decl:
+  | CONST INT ID ASSIGN expr SEMICOLON { ($3, $5) }
+;
+
+var_decl:
+  | INT ID ASSIGN expr SEMICOLON { ($2, $4) }
 ;
 
 func_def:
-  | INT ID LPAREN param_list RPAREN block { failwith "TODO: parse int function" }
-  | VOID ID LPAREN param_list RPAREN block { failwith "TODO: parse void function" }
+  | INT ID LPAREN param_list RPAREN block
+    { { ret_type = IntRet; name = $2; params = $4; body = $6 } }
+  | VOID ID LPAREN param_list RPAREN block
+    { { ret_type = VoidRet; name = $2; params = $4; body = $6 } }
 ;
 
 param_list:
@@ -66,12 +99,12 @@ param:
 ;
 
 block:
-  | LBRACE stmts RBRACE { $2 }
+  | LBRACE block_tail RBRACE { $2 }
 ;
 
-stmts:
+block_tail:
   | { [] }
-  | stmt stmts { $1 :: $2 }
+  | stmt block_tail { $1 :: $2 }
 ;
 
 stmt:
@@ -79,10 +112,13 @@ stmt:
   | SEMICOLON { Empty }
   | expr SEMICOLON { ExprStmt $1 }
   | ID ASSIGN expr SEMICOLON { Assign ($1, $3) }
-  | decl { failwith "TODO: parse declaration statement" }
-  | IF LPAREN expr RPAREN stmt %prec THEN { failwith "TODO: parse if statement" }
-  | IF LPAREN expr RPAREN stmt ELSE stmt { failwith "TODO: parse if-else statement" }
-  | WHILE LPAREN expr RPAREN stmt { failwith "TODO: parse while statement" }
+  | decl
+    { match $1 with
+      | DConst (name, e) -> ConstDecl (name, e)
+      | DVar (name, e) -> VarDecl (name, e) }
+  | IF LPAREN expr RPAREN stmt %prec THEN { If ($3, $5, None) }
+  | IF LPAREN expr RPAREN stmt ELSE stmt { If ($3, $5, Some $7) }
+  | WHILE LPAREN expr RPAREN stmt { While ($3, $5) }
   | BREAK SEMICOLON { Break }
   | CONTINUE SEMICOLON { Continue }
   | RETURN SEMICOLON { Return None }
@@ -90,17 +126,17 @@ stmt:
 ;
 
 expr:
-  | lor_expr { $1 }
+  | l_or_expr { $1 }
 ;
 
-lor_expr:
-  | land_expr { $1 }
-  | lor_expr OR land_expr { Binary ($1, Or, $3) }
+l_or_expr:
+  | l_and_expr { $1 }
+  | l_or_expr OR l_and_expr { Binary ($1, Or, $3) }
 ;
 
-land_expr:
+l_and_expr:
   | rel_expr { $1 }
-  | land_expr AND rel_expr { Binary ($1, And, $3) }
+  | l_and_expr AND rel_expr { Binary ($1, And, $3) }
 ;
 
 rel_expr:
@@ -115,21 +151,21 @@ rel_expr:
 
 add_expr:
   | mul_expr { $1 }
-  | add_expr PLUS mul_expr { Binary ($1, Add, $3) }
-  | add_expr MINUS mul_expr { Binary ($1, Sub, $3) }
+  | add_expr ADD mul_expr { Binary ($1, Add, $3) }
+  | add_expr SUB mul_expr { Binary ($1, Sub, $3) }
 ;
 
 mul_expr:
   | unary_expr { $1 }
-  | mul_expr TIMES unary_expr { Binary ($1, Mul, $3) }
-  | mul_expr DIVIDE unary_expr { Binary ($1, Div, $3) }
+  | mul_expr MUL unary_expr { Binary ($1, Mul, $3) }
+  | mul_expr DIV unary_expr { Binary ($1, Div, $3) }
   | mul_expr MOD unary_expr { Binary ($1, Mod, $3) }
 ;
 
 unary_expr:
   | primary_expr { $1 }
-  | PLUS unary_expr %prec UPLUS { Unary (UPlus, $2) }
-  | MINUS unary_expr %prec UMINUS { Unary (UMinus, $2) }
+  | ADD unary_expr %prec UADD { Unary (UPlus, $2) }
+  | SUB unary_expr %prec UMINUS { Unary (UMinus, $2) }
   | NOT unary_expr { Unary (Not, $2) }
 ;
 
@@ -137,11 +173,11 @@ primary_expr:
   | ID { Var $1 }
   | NUMBER { IntLit $1 }
   | LPAREN expr RPAREN { $2 }
-  | ID LPAREN arg_list RPAREN { Call ($1, $3) }
+  | ID LPAREN expr_list_opt RPAREN { Call ($1, $3) }
 ;
 
-arg_list:
+expr_list_opt:
   | { [] }
   | expr { [$1] }
-  | arg_list COMMA expr { $1 @ [$3] }
+  | expr_list_opt COMMA expr { $1 @ [$3] }
 ;

@@ -1,3 +1,7 @@
 (test
  (name test_lexer)
  (libraries frontend))
+
+(test
+ (name test_parser)
+ (libraries ast frontend))

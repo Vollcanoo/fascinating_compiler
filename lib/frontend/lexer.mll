@@ -29,10 +29,10 @@ rule read = parse
   | "||" { OR }
   | ";" { SEMICOLON }
   | "=" { ASSIGN }
-  | "+" { PLUS }
-  | "-" { MINUS }
-  | "*" { TIMES }
-  | "/" { DIVIDE }
+  | "+" { ADD }
+  | "-" { SUB }
+  | "*" { MUL }
+  | "/" { DIV }
   | "%" { MOD }
   | "<" { LT }
   | ">" { GT }
@@ -43,7 +43,7 @@ rule read = parse
   | "}" { RBRACE }
   | "," { COMMA }
   | ident as name { ID name }
-  | '-'? ('0' | ['1'-'9'] digit*) as num { NUMBER (int_of_string num) }
+  | ('0' | ['1'-'9'] digit*) as num { NUMBER (int_of_string num) }
   | eof { EOF }
   | _ as c { failwith (Printf.sprintf "Lexical error: unexpected character '%c'" c) }
 
