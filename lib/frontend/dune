@@ -1,0 +1,7 @@
+(ocamllex lexer)
+(ocamlyacc parser)
+
+(library
+ (name frontend)
+ (public_name fascinating_compiler.frontend)
+ (libraries ast))

@@ -1,0 +1,5 @@
+(executable
+ (public_name fascinating_compiler)
+ (name main)
+ (libraries frontend analysis backend)
+ (package fascinating_compiler))

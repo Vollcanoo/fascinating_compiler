@@ -1,0 +1,4 @@
+(library
+ (name analysis)
+ (public_name fascinating_compiler.analysis)
+ (libraries ast))

@@ -1,0 +1,4 @@
+(library
+ (name backend)
+ (public_name fascinating_compiler.backend)
+ (libraries ast analysis))
