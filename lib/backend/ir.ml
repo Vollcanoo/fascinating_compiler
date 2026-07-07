@@ -46,14 +46,12 @@ type program = {
 
 type var_binding = [ `Temp of int | `Global of string | `Const of int ]
 
-type scope = (string * var_binding) list
-
 type gen_env = {
   mutable next_temp : int;
   mutable next_label : int;
   mutable instrs : instr list;
   mutable locals : string list;
-  mutable scopes : scope list;
+  mutable scopes : (string * var_binding) list list;
   loop_stack : (label * label) Stack.t;
 }
 
@@ -86,12 +84,12 @@ let leave_scope env =
   | _ :: rest -> env.scopes <- rest
   | [] -> ()
 
-let add_var env name binding =
+let add_var env (name : string) (binding : var_binding) =
   match env.scopes with
   | scope :: rest -> env.scopes <- ((name, binding) :: scope) :: rest
-  | [] -> env.scopes <- [(name, binding)]
+  | [] -> env.scopes <- [[(name, binding)]]
 
-let rec lookup_var env name =
+let lookup_var env name =
   let rec find_in_scope = function
     | [] -> None
     | (n, b) :: rest -> if n = name then Some b else find_in_scope rest

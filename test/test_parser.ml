@@ -25,7 +25,7 @@ and exp_eq e expected =
 
 let return_exp ast =
   match ast with
-  | [ FuncDef { body = [ Return (Some e) ] } ] -> e
+  | [ FuncDef { body = [ Return (Some e) ]; _ } ] -> e
   | _ -> failwith "expected single return in main"
 
 let test name f =
@@ -57,14 +57,14 @@ let () =
     let ast = parse "int add(int a, int b) { return a + b; } int main() { return 0; }" in
     assert_match "add params"
       (match List.hd ast with
-       | FuncDef { name = "add"; params = [ "a"; "b" ]; ret_type = IntRet } -> true
+       | FuncDef { name = "add"; params = [ "a"; "b" ]; ret_type = IntRet; _ } -> true
        | _ -> false));
 
   test "void function" (fun () ->
     let ast = parse "void f() { ; } int main() { return 0; }" in
     assert_match "void ret"
       (match List.hd ast with
-       | FuncDef { name = "f"; ret_type = VoidRet; body = [ Empty ] } -> true
+       | FuncDef { name = "f"; ret_type = VoidRet; body = [ Empty ]; _ } -> true
        | _ -> false));
 
   test "nested block" (fun () ->
@@ -79,7 +79,7 @@ let () =
     let ast = parse "int main() { while (1) { break; continue; } return 0; }" in
     assert_match "while with break/continue"
       (match ast with
-       | [ FuncDef { body = [ While (_, Block [ Break; Continue ]); Return (Some (IntLit 0)) ] } ]
+       | [ FuncDef { body = [ While (_, Block [ Break; Continue ]); Return (Some (IntLit 0)) ]; _ } ]
          -> true
        | _ -> false));
 
@@ -104,7 +104,7 @@ let () =
     let ast = parse "int foo(int a, int b) { return a; } int main() { return foo(1, 2); }" in
     let e =
       match List.nth ast 1 with
-      | FuncDef { body = [ Return (Some e) ] } -> e
+      | FuncDef { body = [ Return (Some e) ]; _ } -> e
       | _ -> failwith "expected main with return"
     in
     assert_match "call with two args" (exp_eq e (Call ("foo", [ IntLit 1; IntLit 2 ]))));
@@ -113,7 +113,7 @@ let () =
     let ast = parse "int main() { if (1) return 0; else return 1; }" in
     assert_match "if else"
       (match ast with
-       | [ FuncDef { body = [ If (IntLit 1, Return (Some (IntLit 0)), Some (Return (Some (IntLit 1)))) ] } ]
+       | [ FuncDef { body = [ If (IntLit 1, Return (Some (IntLit 0)), Some (Return (Some (IntLit 1)))) ]; _ } ]
          -> true
        | _ -> false));
 
