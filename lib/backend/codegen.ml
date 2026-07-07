@@ -15,7 +15,7 @@
  *   +-------------------+ <- old sp = s0
  *   | saved ra          |  s0 - 4
  *   | saved s0 (fp)     |  s0 - 8
- *   | temp spill slots  |  s0 - 8 - 4*i ...
+ *   | temp spill slots  |  s0 - 12, s0 - 16, ...
  *   +-------------------+ <- sp (16-byte aligned)
  *   low address
  *
@@ -46,17 +46,43 @@ let compute_frame func =
   let frame_size = align16 (total_slots * 4) in
   let temp_offset = Hashtbl.create num_temps in
   for i = 0 to num_temps - 1 do
-    Hashtbl.replace temp_offset i (i * 4)
+    Hashtbl.replace temp_offset i ((i + saved_regs) * 4)
   done;
   (frame_size, temp_offset)
 
+let emit_addi ctx rd rs imm =
+  if imm >= -2048 && imm <= 2047 then
+    buf_emit ctx "  addi %s, %s, %d\n" rd rs imm
+  else begin
+    buf_emit ctx "  li t3, %d\n" imm;
+    buf_emit ctx "  add %s, %s, t3\n" rd rs
+  end
+
+let emit_lw ctx reg base offset =
+  if offset >= -2048 && offset <= 2047 then
+    buf_emit ctx "  lw %s, %d(%s)\n" reg offset base
+  else begin
+    buf_emit ctx "  li t3, %d\n" offset;
+    buf_emit ctx "  add t3, %s, t3\n" base;
+    buf_emit ctx "  lw %s, 0(t3)\n" reg
+  end
+
+let emit_sw ctx reg base offset =
+  if offset >= -2048 && offset <= 2047 then
+    buf_emit ctx "  sw %s, %d(%s)\n" reg offset base
+  else begin
+    buf_emit ctx "  li t3, %d\n" offset;
+    buf_emit ctx "  add t3, %s, t3\n" base;
+    buf_emit ctx "  sw %s, 0(t3)\n" reg
+  end
+
 let load_temp ctx reg t =
   let off = Hashtbl.find ctx.temp_offset t in
-  buf_emit ctx "  lw %s, %d(s0)\n" reg (off - ctx.frame_size)
+  emit_lw ctx reg "s0" (- off)
 
 let store_temp ctx reg t =
   let off = Hashtbl.find ctx.temp_offset t in
-  buf_emit ctx "  sw %s, %d(s0)\n" reg (off - ctx.frame_size)
+  emit_sw ctx reg "s0" (- off)
 
 let load_imm ctx reg n =
   buf_emit ctx "  li %s, %d\n" reg n
@@ -65,15 +91,15 @@ let emit_global_addr ctx reg name =
   buf_emit ctx "  la %s, %s\n" reg name
 
 let emit_prologue ctx =
-  buf_emit ctx "  addi sp, sp, -%d\n" ctx.frame_size;
-  buf_emit ctx "  sw ra, %d(sp)\n" (ctx.frame_size - 4);
-  buf_emit ctx "  sw s0, %d(sp)\n" (ctx.frame_size - 8);
-  buf_emit ctx "  addi s0, sp, %d\n" ctx.frame_size
+  emit_addi ctx "sp" "sp" (- ctx.frame_size);
+  emit_sw ctx "ra" "sp" (ctx.frame_size - 4);
+  emit_sw ctx "s0" "sp" (ctx.frame_size - 8);
+  emit_addi ctx "s0" "sp" ctx.frame_size
 
 let emit_epilogue ctx =
-  buf_emit ctx "  lw ra, %d(sp)\n" (ctx.frame_size - 4);
-  buf_emit ctx "  lw s0, %d(sp)\n" (ctx.frame_size - 8);
-  buf_emit ctx "  addi sp, sp, %d\n" ctx.frame_size;
+  emit_lw ctx "ra" "sp" (ctx.frame_size - 4);
+  emit_lw ctx "s0" "sp" (ctx.frame_size - 8);
+  emit_addi ctx "sp" "sp" ctx.frame_size;
   buf_emit ctx "  ret\n"
 
 let emit_binop ctx dst op lhs rhs =
@@ -122,7 +148,7 @@ let emit_call ctx dst_opt name args =
   let stack_args = if nargs > 8 then nargs - 8 else 0 in
   if stack_args > 0 then begin
     let extra = align16 (stack_args * 4) in
-    buf_emit ctx "  addi sp, sp, -%d\n" extra
+    emit_addi ctx "sp" "sp" (- extra)
   end;
   List.iteri (fun i t ->
     if i < 8 then begin
@@ -135,7 +161,7 @@ let emit_call ctx dst_opt name args =
   buf_emit ctx "  call %s\n" name;
   if stack_args > 0 then begin
     let extra = align16 (stack_args * 4) in
-    buf_emit ctx "  addi sp, sp, %d\n" extra
+    emit_addi ctx "sp" "sp" extra
   end;
   (match dst_opt with
    | Some dst -> store_temp ctx "a0" dst
@@ -200,11 +226,12 @@ let emit_func ctx func =
     if i < 8 then
       store_temp ctx arg_regs.(i) i
     else begin
-      buf_emit ctx "  lw t0, %d(s0)\n" ((i - 8) * 4);
+      emit_lw ctx "t0" "s0" ((i - 8) * 4);
       store_temp ctx "t0" i
     end
   ) func.params;
-  List.iter (emit_instr ctx) func.body
+  List.iter (emit_instr ctx) func.body;
+  emit_epilogue ctx
 
 let emit_globals ctx globals =
   let has_data = List.exists (fun g ->

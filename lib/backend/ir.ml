@@ -5,23 +5,23 @@ open Ast
 type operand =
   | Imm of int
   | Temp of int
-  | Name of string  (* global variable / function name *)
+  | Name of string
 
 type label = string
 
 type instr =
-  | ILoad of int * operand         (* dst_temp <- operand (move/load) *)
-  | ILoadGlobal of int * string    (* dst_temp <- global variable *)
-  | IStoreGlobal of string * int   (* global variable <- src_temp *)
-  | IBinOp of int * bin_op * int * int   (* dst <- op lhs rhs *)
-  | IUnaryOp of int * unary_op * int     (* dst <- op src *)
-  | ICall of int * string * int list     (* dst <- call func args *)
-  | ICallVoid of string * int list       (* call func args (no return) *)
+  | ILoad of int * operand
+  | ILoadGlobal of int * string
+  | IStoreGlobal of string * int
+  | IBinOp of int * bin_op * int * int
+  | IUnaryOp of int * unary_op * int
+  | ICall of int * string * int list
+  | ICallVoid of string * int list
   | ILabel of label
   | IJump of label
-  | IBranchTrue of int * label     (* if temp != 0 goto label *)
-  | IBranchFalse of int * label    (* if temp == 0 goto label *)
-  | IReturn of int option          (* return [temp] *)
+  | IBranchTrue of int * label
+  | IBranchFalse of int * label
+  | IReturn of int option
   | IComment of string
 
 type func_ir = {
@@ -35,22 +35,26 @@ type func_ir = {
 
 type global =
   | GConst of string * int
-  | GVar of string * int   (* name, initial value *)
+  | GVar of string * int
 
 type program = {
   globals : global list;
   funcs : func_ir list;
 }
 
-(* --- IR generation from AST --- *)
+(* --- Scoped variable environment --- *)
+
+type var_binding = [ `Temp of int | `Global of string | `Const of int ]
+
+type scope = (string * var_binding) list
 
 type gen_env = {
   mutable next_temp : int;
   mutable next_label : int;
   mutable instrs : instr list;
   mutable locals : string list;
-  vars : (string, [`Temp of int | `Global of string | `Const of int]) Hashtbl.t;
-  loop_stack : (label * label) Stack.t;  (* (continue_label, break_label) *)
+  mutable scopes : scope list;
+  loop_stack : (label * label) Stack.t;
 }
 
 let new_env () = {
@@ -58,7 +62,7 @@ let new_env () = {
   next_label = 0;
   instrs = [];
   locals = [];
-  vars = Hashtbl.create 32;
+  scopes = [[]];
   loop_stack = Stack.create ();
 }
 
@@ -74,6 +78,33 @@ let fresh_label env prefix =
 
 let emit env instr = env.instrs <- instr :: env.instrs
 
+let enter_scope env =
+  env.scopes <- [] :: env.scopes
+
+let leave_scope env =
+  match env.scopes with
+  | _ :: rest -> env.scopes <- rest
+  | [] -> ()
+
+let add_var env name binding =
+  match env.scopes with
+  | scope :: rest -> env.scopes <- ((name, binding) :: scope) :: rest
+  | [] -> env.scopes <- [(name, binding)]
+
+let rec lookup_var env name =
+  let rec find_in_scope = function
+    | [] -> None
+    | (n, b) :: rest -> if n = name then Some b else find_in_scope rest
+  in
+  let rec find_in_scopes = function
+    | [] -> None
+    | scope :: rest ->
+      (match find_in_scope scope with
+       | Some _ as found -> found
+       | None -> find_in_scopes rest)
+  in
+  find_in_scopes env.scopes
+
 let rec gen_expr env (e : exp) : int =
   match e with
   | IntLit n ->
@@ -81,7 +112,7 @@ let rec gen_expr env (e : exp) : int =
     emit env (ILoad (t, Imm n));
     t
   | Var name ->
-    (match Hashtbl.find_opt env.vars name with
+    (match lookup_var env name with
      | Some (`Temp t) -> t
      | Some (`Global g) ->
        let t = fresh_temp env in
@@ -154,7 +185,7 @@ and gen_short_circuit_or env lhs rhs =
   result
 
 let gen_store_var env name src_temp =
-  match Hashtbl.find_opt env.vars name with
+  match lookup_var env name with
   | Some (`Temp dst) ->
     if dst <> src_temp then
       emit env (ILoad (dst, Temp src_temp))
@@ -173,17 +204,19 @@ let rec gen_stmt env (s : stmt) : unit =
     gen_store_var env name t
   | ConstDecl (name, e) ->
     let dst = fresh_temp env in
-    Hashtbl.replace env.vars name (`Temp dst);
+    add_var env name (`Temp dst);
     let t = gen_expr env e in
     if t <> dst then emit env (ILoad (dst, Temp t))
   | VarDecl (name, e) ->
     env.locals <- name :: env.locals;
     let dst = fresh_temp env in
-    Hashtbl.replace env.vars name (`Temp dst);
+    add_var env name (`Temp dst);
     let t = gen_expr env e in
     if t <> dst then emit env (ILoad (dst, Temp t))
   | Block body ->
-    List.iter (gen_stmt env) body
+    enter_scope env;
+    List.iter (gen_stmt env) body;
+    leave_scope env
   | If (cond, then_s, else_s) ->
     gen_if env cond then_s else_s
   | While (cond, body) ->
@@ -235,14 +268,18 @@ let gen_func (globals : (string * [`Const of int | `Var]) list) (fd : func_def) 
   let env = new_env () in
   List.iter (fun (name, kind) ->
     match kind with
-    | `Const n -> Hashtbl.replace env.vars name (`Const n)
-    | `Var -> Hashtbl.replace env.vars name (`Global name)
+    | `Const n -> add_var env name (`Const n)
+    | `Var -> add_var env name (`Global name)
   ) globals;
+  enter_scope env;
   List.iter (fun p ->
     let t = fresh_temp env in
-    Hashtbl.replace env.vars p (`Temp t)
+    add_var env p (`Temp t)
   ) fd.params;
+  enter_scope env;
   List.iter (gen_stmt env) fd.body;
+  leave_scope env;
+  leave_scope env;
   (match fd.ret_type with
    | VoidRet ->
      (match env.instrs with
@@ -258,32 +295,39 @@ let gen_func (globals : (string * [`Const of int | `Var]) list) (fd : func_def) 
     temp_count = env.next_temp;
   }
 
-let rec eval_const_init = function
+let rec eval_const_init globals = function
   | IntLit n -> n
-  | Unary (UMinus, e) -> -(eval_const_init e)
-  | Unary (UPlus, e) -> eval_const_init e
-  | Unary (Not, e) -> if eval_const_init e = 0 then 1 else 0
-  | Binary (lhs, Add, rhs) -> eval_const_init lhs + eval_const_init rhs
-  | Binary (lhs, Sub, rhs) -> eval_const_init lhs - eval_const_init rhs
-  | Binary (lhs, Mul, rhs) -> eval_const_init lhs * eval_const_init rhs
-  | Binary (lhs, Div, rhs) -> eval_const_init lhs / eval_const_init rhs
-  | Binary (lhs, Mod, rhs) -> eval_const_init lhs mod eval_const_init rhs
+  | Var name ->
+    (match List.assoc_opt name globals with
+     | Some v -> v
+     | None -> 0)
+  | Unary (UMinus, e) -> -(eval_const_init globals e)
+  | Unary (UPlus, e) -> eval_const_init globals e
+  | Unary (Not, e) -> if eval_const_init globals e = 0 then 1 else 0
+  | Binary (lhs, Add, rhs) -> eval_const_init globals lhs + eval_const_init globals rhs
+  | Binary (lhs, Sub, rhs) -> eval_const_init globals lhs - eval_const_init globals rhs
+  | Binary (lhs, Mul, rhs) -> eval_const_init globals lhs * eval_const_init globals rhs
+  | Binary (lhs, Div, rhs) -> eval_const_init globals lhs / eval_const_init globals rhs
+  | Binary (lhs, Mod, rhs) -> eval_const_init globals lhs mod eval_const_init globals rhs
   | _ -> 0
 
 let lower (cu : comp_unit) : program =
   let globals = ref [] in
   let global_info = ref [] in
+  let global_values = ref [] in
   let funcs = ref [] in
   List.iter (fun tl ->
     match tl with
     | GlobalConstDecl (name, e) ->
-      let value = eval_const_init e in
+      let value = eval_const_init !global_values e in
       globals := GConst (name, value) :: !globals;
-      global_info := (name, `Const value) :: !global_info
+      global_info := (name, `Const value) :: !global_info;
+      global_values := (name, value) :: !global_values
     | GlobalVarDecl (name, e) ->
-      let value = eval_const_init e in
+      let value = eval_const_init !global_values e in
       globals := GVar (name, value) :: !globals;
-      global_info := (name, `Var) :: !global_info
+      global_info := (name, `Var) :: !global_info;
+      global_values := (name, value) :: !global_values
     | FuncDef fd ->
       funcs := gen_func !global_info fd :: !funcs
   ) cu;

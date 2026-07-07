@@ -19,17 +19,15 @@ let expect_declared_func name tbl =
 let declare_value name value tbl =
   if ST.has_current_value name tbl
   then error ("duplicate declaration of '" ^ name ^ "' in the same scope")
-  else if ST.has_func name tbl
-  then error ("declaration of '" ^ name ^ "' conflicts with a function")
   else ST.add_value name value tbl
 
 let declare_global_value name value tbl =
-  if ST.has_global_value name tbl || ST.has_func name tbl
+  if ST.has_global_value name tbl
   then error ("duplicate global declaration of '" ^ name ^ "'")
   else ST.add_value name value tbl
 
 let declare_func fd tbl =
-  if ST.has_func fd.name tbl || ST.has_global_value fd.name tbl
+  if ST.has_func fd.name tbl
   then error ("duplicate function name '" ^ fd.name ^ "'")
   else ST.add_func fd.name { ST.ret_type = fd.ret_type; arity = List.length fd.params } tbl
 
