@@ -1,6 +1,3 @@
-(** Semantic analysis for ToyC *)
+(** Compatibility module for the existing compiler entry point. *)
 
-open Ast
-
-let check (_cu : comp_unit) : unit =
-  failwith "TODO: semantic analysis"
+include Semant
