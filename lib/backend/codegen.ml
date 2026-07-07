@@ -46,7 +46,7 @@ let compute_frame func =
   let frame_size = align16 (total_slots * 4) in
   let temp_offset = Hashtbl.create num_temps in
   for i = 0 to num_temps - 1 do
-    Hashtbl.replace temp_offset i ((i + saved_regs) * 4)
+    Hashtbl.replace temp_offset i (i * 4)
   done;
   (frame_size, temp_offset)
 
@@ -78,11 +78,11 @@ let emit_sw ctx reg base offset =
 
 let load_temp ctx reg t =
   let off = Hashtbl.find ctx.temp_offset t in
-  emit_lw ctx reg "s0" (- off)
+  emit_lw ctx reg "s0" (off - ctx.frame_size)
 
 let store_temp ctx reg t =
   let off = Hashtbl.find ctx.temp_offset t in
-  emit_sw ctx reg "s0" (- off)
+  emit_sw ctx reg "s0" (off - ctx.frame_size)
 
 let load_imm ctx reg n =
   buf_emit ctx "  li %s, %d\n" reg n
