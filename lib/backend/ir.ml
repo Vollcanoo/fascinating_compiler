@@ -55,6 +55,8 @@ type gen_env = {
   loop_stack : (label * label) Stack.t;
 }
 
+let global_label_counter = ref 0
+
 let new_env () = {
   next_temp = 0;
   next_label = 0;
@@ -69,9 +71,9 @@ let fresh_temp env =
   env.next_temp <- env.next_temp + 1;
   t
 
-let fresh_label env prefix =
-  let n = env.next_label in
-  env.next_label <- env.next_label + 1;
+let fresh_label _env prefix =
+  let n = !global_label_counter in
+  global_label_counter := n + 1;
   Printf.sprintf ".L%s%d" prefix n
 
 let emit env instr = env.instrs <- instr :: env.instrs
