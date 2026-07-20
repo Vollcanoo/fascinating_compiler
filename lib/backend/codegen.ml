@@ -33,6 +33,7 @@ type emit_ctx = {
   func : func_ir;
   mutable frame_size : int;
   temp_offset : (int, int) Hashtbl.t;
+  branch_cnt : int ref;
 }
 
 let buf_emit ctx fmt = Printf.bprintf ctx.out fmt
@@ -201,10 +202,20 @@ let emit_instr ctx instr =
     buf_emit ctx "  j %s\n" lbl
   | IBranchTrue (t, lbl) ->
     load_temp ctx "t0" t;
-    buf_emit ctx "  bnez t0, %s\n" lbl
+    let n = !(ctx.branch_cnt) in
+    ctx.branch_cnt := n + 1;
+    let skip = Printf.sprintf ".Lskip%d" n in
+    buf_emit ctx "  beqz t0, %s\n" skip;
+    buf_emit ctx "  j %s\n" lbl;
+    buf_emit ctx "%s:\n" skip
   | IBranchFalse (t, lbl) ->
     load_temp ctx "t0" t;
-    buf_emit ctx "  beqz t0, %s\n" lbl
+    let n = !(ctx.branch_cnt) in
+    ctx.branch_cnt := n + 1;
+    let skip = Printf.sprintf ".Lskip%d" n in
+    buf_emit ctx "  bnez t0, %s\n" skip;
+    buf_emit ctx "  j %s\n" lbl;
+    buf_emit ctx "%s:\n" skip
   | IReturn opt ->
     (match opt with
      | Some t -> load_temp ctx "a0" t
@@ -218,7 +229,6 @@ let emit_func ctx func =
   let ctx = { ctx with func; frame_size; temp_offset } in
   buf_emit ctx "\n  .text\n";
   buf_emit ctx "  .globl %s\n" func.name;
-  buf_emit ctx "  .type %s, @function\n" func.name;
   buf_emit ctx "%s:\n" func.name;
   emit_prologue ctx;
   let arg_regs = [| "a0"; "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7" |] in
@@ -242,12 +252,12 @@ let emit_globals ctx globals =
       match g with
       | GConst (name, value) ->
         buf_emit ctx "  .globl %s\n" name;
-        buf_emit ctx "  .type %s, @object\n" name;
+        buf_emit ctx "  .align 2\n";
         buf_emit ctx "%s:\n" name;
         buf_emit ctx "  .word %d\n" value
       | GVar (name, value) ->
         buf_emit ctx "  .globl %s\n" name;
-        buf_emit ctx "  .type %s, @object\n" name;
+        buf_emit ctx "  .align 2\n";
         buf_emit ctx "%s:\n" name;
         buf_emit ctx "  .word %d\n" value
     ) globals
@@ -260,6 +270,7 @@ let emit (out : out_channel) (prog : program) : unit =
              body = []; temp_count = 0 };
     frame_size = 0;
     temp_offset = Hashtbl.create 0;
+    branch_cnt = ref 0;
   } in
   emit_globals ctx prog.globals;
   List.iter (emit_func ctx) prog.funcs;
