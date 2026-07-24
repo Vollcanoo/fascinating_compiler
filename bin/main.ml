@@ -1,6 +1,6 @@
 (** ToyC compiler entry point: stdin -> stdout *)
 
-let optimize = ref false
+let optimize = ref true
 
 let options =
   [ "-opt", Arg.Set optimize, " Enable optimization passes" ]
