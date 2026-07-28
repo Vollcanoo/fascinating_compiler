@@ -509,13 +509,4 @@ let optimize_func f =
    Program
    ===================================================== *)
 
-let run (p:program) =
-
- {
-   p with
-
-   funcs =
-     List.map
-       optimize_func
-       p.funcs
- }
+let run p = p
