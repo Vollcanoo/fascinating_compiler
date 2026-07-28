@@ -1,309 +1,528 @@
-(** Safe optimization passes for ToyC IR *)
+(** Optimization passes for ToyC IR *)
 
 open Ir
 module A = Ast
+
 
 
 (* =====================================================
    Constant evaluation
    ===================================================== *)
 
-let eval_binop op a b =
+let eval_binop (op:A.bin_op) a b =
   match op with
-  | A.Add ->
-      Some (a + b)
 
-  | A.Sub ->
-      Some (a - b)
-
-  | A.Mul ->
-      Some (a * b)
+  | A.Add -> Some (a+b)
+  | A.Sub -> Some (a-b)
+  | A.Mul -> Some (a*b)
 
   | A.Div ->
-      if b = 0 then None
-      else if a = min_int && b = -1 then None
-      else Some (a / b)
+      if b=0 then None
+      else if a=min_int && b=(-1)
+      then None
+      else Some(a/b)
 
   | A.Mod ->
-      if b = 0 then None
-      else Some (a mod b)
-
+      if b=0 then None
+      else Some(a mod b)
 
   | A.Lt ->
-      Some (if a < b then 1 else 0)
+      Some(if a<b then 1 else 0)
 
   | A.Gt ->
-      Some (if a > b then 1 else 0)
+      Some(if a>b then 1 else 0)
 
   | A.Le ->
-      Some (if a <= b then 1 else 0)
+      Some(if a<=b then 1 else 0)
 
   | A.Ge ->
-      Some (if a >= b then 1 else 0)
+      Some(if a>=b then 1 else 0)
 
   | A.Eq ->
-      Some (if a = b then 1 else 0)
+      Some(if a=b then 1 else 0)
 
   | A.Ne ->
-      Some (if a <> b then 1 else 0)
+      Some(if a<>b then 1 else 0)
 
   | A.And ->
-      Some (if a <> 0 && b <> 0 then 1 else 0)
+      Some(if a<>0 && b<>0 then 1 else 0)
 
   | A.Or ->
-      Some (if a <> 0 || b <> 0 then 1 else 0)
+      Some(if a<>0 || b<>0 then 1 else 0)
 
 
 
-let eval_unary op a =
+let eval_unary (op:A.unary_op) a =
   match op with
 
   | A.UPlus ->
       Some a
 
   | A.UMinus ->
-      if a = min_int then None
-      else Some (-a)
+      if a=min_int then None
+      else Some(-a)
 
   | A.Not ->
-      Some (if a = 0 then 1 else 0)
+      Some(if a=0 then 1 else 0)
 
 
 
 (* =====================================================
-   Constant table
-   only records real constants
-   NO copy propagation
+   Optimization environment
    ===================================================== *)
 
-type env = (int, int) Hashtbl.t
+
+type env =
+{
+  const_table:(int,int) Hashtbl.t;
+
+  copy_table:(int,int) Hashtbl.t;
+}
+
+
+
+let create_env () =
+{
+ const_table=Hashtbl.create 64;
+ copy_table=Hashtbl.create 64;
+}
+
+
+
+let clear_env env =
+(
+ Hashtbl.clear env.const_table;
+ Hashtbl.clear env.copy_table
+)
+
+
+
+(* remove definitions of t *)
+
+let kill env t =
+
+ Hashtbl.remove env.const_table t;
+
+ Hashtbl.remove env.copy_table t;
+
+
+
+ let dead = ref [] in
+
+ Hashtbl.iter
+   (fun k v ->
+      if v=t then
+        dead:=k::!dead)
+   env.copy_table;
+
+
+ List.iter
+   (fun k ->
+      Hashtbl.remove env.copy_table k)
+   !dead
+
+
+
+(* resolve copy chain *)
+
+let rec resolve_copy env t =
+
+ match Hashtbl.find_opt env.copy_table t with
+
+ | None ->
+     t
+
+ | Some x ->
+
+     if x=t then t
+
+     else
+
+       let r =
+         resolve_copy env x
+       in
+
+       Hashtbl.replace env.copy_table t r;
+
+       r
 
 
 
 let get_const env t =
-  Hashtbl.find_opt env t
 
+ let t =
+   resolve_copy env t
+ in
 
-
-let kill env t =
-  Hashtbl.remove env t
-
-
-
-let clear env =
-  Hashtbl.clear env
+ Hashtbl.find_opt env.const_table t
 
 
 
 (* =====================================================
-   Constant folding
+   Rewrite instruction
    ===================================================== *)
 
 let optimize_instr env instr =
 
-  match instr with
 
-
-  (* t = immediate *)
-  | ILoad(dst, Imm n) ->
-
-      Hashtbl.replace env dst n;
-      instr
+match instr with
 
 
 
-  (* t = another temp
-     
-     IMPORTANT:
-     Do NOT propagate.
-     Because temp can be overwritten.
-     
-     Example:
-       t1=t0
-       t0=5
-     
-     t1 is not necessarily 5.
-  *)
-  | ILoad(dst, Temp _) ->
+(* t = immediate *)
 
-      kill env dst;
-      instr
+| ILoad(dst,Imm n) ->
+
+
+    kill env dst;
+
+    Hashtbl.replace
+      env.const_table
+      dst
+      n;
+
+    instr
 
 
 
-  (* load address/global *)
-  | ILoad(dst, Name _) ->
-
-      kill env dst;
-      instr
 
 
+(* copy propagation *)
 
-  | ILoadGlobal(dst, _) ->
-
-      kill env dst;
-      instr
+| ILoad(dst,Temp src) ->
 
 
-
-  (* binary operation *)
-  | IBinOp(dst, op, a, b) ->
-
-      begin
-        match get_const env a,
-              get_const env b with
+    let src =
+      resolve_copy env src
+    in
 
 
-        | Some x, Some y ->
+    begin
 
-            begin
-              match eval_binop op x y with
-
-              | Some r ->
-
-                  Hashtbl.replace env dst r;
-
-                  ILoad(dst, Imm r)
+    match get_const env src with
 
 
-              | None ->
+    | Some n ->
 
-                  kill env dst;
+        kill env dst;
 
-                  instr
-            end
+        Hashtbl.replace
+          env.const_table
+          dst
+          n;
+
+        ILoad(dst,Imm n)
 
 
 
-        | _ ->
+    | None ->
+
+
+        kill env dst;
+
+
+        if dst<>src then
+
+          Hashtbl.replace
+            env.copy_table
+            dst
+            src;
+
+
+        ILoad(dst,Temp src)
+
+    end
+
+
+
+
+
+| ILoad(dst,Name n) ->
+
+
+    kill env dst;
+
+    ILoad(dst,Name n)
+
+
+
+
+
+| ILoadGlobal(dst,n) ->
+
+
+    kill env dst;
+
+    ILoadGlobal(dst,n)
+
+
+
+
+
+(* binary constant folding *)
+
+| IBinOp(dst,op,a,b) ->
+
+
+    let a =
+      resolve_copy env a
+    in
+
+
+    let b =
+      resolve_copy env b
+    in
+
+
+    begin
+
+    match get_const env a,
+          get_const env b with
+
+
+    | Some x,Some y ->
+
+
+        begin
+
+        match eval_binop op x y with
+
+
+        | Some r ->
+
 
             kill env dst;
 
-            instr
-      end
+
+            Hashtbl.replace
+              env.const_table
+              dst
+              r;
 
 
-
-  (* unary operation *)
-  | IUnaryOp(dst, op, t) ->
-
-      begin
-        match get_const env t with
-
-
-        | Some x ->
-
-            begin
-              match eval_unary op x with
-
-              | Some r ->
-
-                  Hashtbl.replace env dst r;
-
-                  ILoad(dst, Imm r)
-
-
-              | None ->
-
-                  kill env dst;
-
-                  instr
-            end
+            ILoad(dst,Imm r)
 
 
 
         | None ->
 
+
             kill env dst;
 
-            instr
-      end
+            IBinOp(dst,op,a,b)
+
+        end
 
 
 
-  (* calls may change everything *)
-  | ICall(dst, _, _) ->
-
-      clear env;
-      kill env dst;
-      instr
+    | _ ->
 
 
+        kill env dst;
 
-  | ICallVoid _ ->
+        IBinOp(dst,op,a,b)
 
-      clear env;
-      instr
-
-
-
-  (* global write *)
-  | IStoreGlobal _ ->
-
-      clear env;
-      instr
-
-
-
-  (* control flow boundary
-
-     We cannot know which path arrives here.
-  *)
-  | ILabel _
-  | IJump _
-  | IBranchTrue _
-  | IBranchFalse _ ->
-
-      clear env;
-      instr
-
-
-
-  | IReturn _
-  | IComment _ ->
-
-      instr
+    end
 
 
 
 
 
-let constant_fold body =
+(* unary folding *)
 
-  let env =
-    Hashtbl.create 32
-  in
+| IUnaryOp(dst,op,t) ->
 
-  List.map
-    (optimize_instr env)
-    body
+
+    let t =
+      resolve_copy env t
+    in
+
+
+    begin
+
+    match get_const env t with
+
+
+    | Some x ->
+
+
+        begin
+
+        match eval_unary op x with
+
+
+        | Some r ->
+
+
+            kill env dst;
+
+
+            Hashtbl.replace
+              env.const_table
+              dst
+              r;
+
+
+            ILoad(dst,Imm r)
+
+
+
+        | None ->
+
+
+            kill env dst;
+
+            IUnaryOp(dst,op,t)
+
+        end
+
+
+
+    | None ->
+
+
+        kill env dst;
+
+        IUnaryOp(dst,op,t)
+
+    end
+
+
+
+
+
+(* function call *)
+
+| ICall(dst,name,args) ->
+
+
+    let args =
+      List.map
+        (resolve_copy env)
+        args
+    in
+
+
+    clear_env env;
+
+
+    kill env dst;
+
+
+    ICall(dst,name,args)
+
+
+
+
+
+| ICallVoid(name,args) ->
+
+
+    let args =
+      List.map
+        (resolve_copy env)
+        args
+    in
+
+
+    clear_env env;
+
+
+    ICallVoid(name,args)
+
+
+
+
+
+(* global memory write *)
+
+| IStoreGlobal _ ->
+
+
+    clear_env env;
+
+    instr
+
+
+
+
+
+(* control flow *)
+
+| ILabel _
+| IJump _
+| IBranchTrue _
+| IBranchFalse _ ->
+
+
+    clear_env env;
+
+    instr
+
+
+
+
+
+| IReturn _
+| IComment _ ->
+
+
+    instr
+
+
+
+
+(* =====================================================
+   Pass
+   ===================================================== *)
+
+let constant_copy_propagation body =
+
+
+ let env =
+   create_env ()
+ in
+
+
+ List.map
+   (optimize_instr env)
+   body
 
 
 
 
 
 (* =====================================================
-   Function / Program
+   Function
    ===================================================== *)
 
-let optimize_func (f : func_ir) =
+let optimize_func (f:func_ir) =
 
-  let body =
-    constant_fold f.body
-  in
-
-  {
-    f with
-    body
-  }
+ let body =
+   constant_copy_propagation f.body
+ in
 
 
+ {
+   f with
+   body
+ }
 
-let run (p : program) : program =
 
-  {
-    p with
 
-    funcs =
-      List.map optimize_func p.funcs
-  }
+
+
+(* =====================================================
+   Program
+   ===================================================== *)
+
+let run (p:program) =
+
+ {
+   p with
+
+   funcs =
+     List.map
+       optimize_func
+       p.funcs
+ }
