@@ -1,6 +1,7 @@
 (** Optimization passes for ToyC IR *)
 
 open Ir
+open Cfg
 module A = Ast
 
 
@@ -473,22 +474,17 @@ match instr with
 
 
 (* =====================================================
-   Pass
+   Block‑level optimization (replaces constant_copy_propagation)
    ===================================================== *)
 
-let constant_copy_propagation body =
-
-
- let env =
-   create_env ()
- in
-
-
- List.map
-   (optimize_instr env)
-   body
-
-
+let optimize_block block =
+  let env = create_env () in
+  let instrs =
+    List.map
+      (optimize_instr env)
+      block.instrs
+  in
+  { block with instrs }
 
 
 
@@ -496,19 +492,16 @@ let constant_copy_propagation body =
    Function
    ===================================================== *)
 
-let optimize_func (f:func_ir) =
-
- let body =
-   constant_copy_propagation f.body
- in
-
-
- {
-   f with
-   body
- }
-
-
+let optimize_func f =
+  let cfg = Cfg.build f.body in
+  let blocks =
+    Array.map optimize_block cfg.blocks
+  in
+  let body =
+    Array.to_list blocks
+    |> List.concat_map (fun b -> b.instrs)
+  in
+  { f with body }
 
 
 
