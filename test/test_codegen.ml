@@ -29,6 +29,47 @@ let compile source =
   assembly
 
 let () =
+  (* A value used at a loop header remains live across the whole backedge.
+     Textual live intervals alone would incorrectly give t0 and t1 the same
+     register, so continue/body code could overwrite the next condition. *)
+  let loop_ir : Backend.Ir.func_ir = {
+    name = "loop_liveness";
+    ret_type = Ast.IntRet;
+    params = [];
+    locals = [];
+    body = [
+      Backend.Ir.ILoad (0, Backend.Ir.Imm 5);
+      Backend.Ir.ILabel ".Lloop_liveness";
+      Backend.Ir.IBranchFalse (0, ".Lloop_liveness_end");
+      Backend.Ir.ILoad (1, Backend.Ir.Imm 1);
+      Backend.Ir.IStoreGlobal ("sink", 1);
+      Backend.Ir.IJump ".Lloop_liveness";
+      Backend.Ir.ILabel ".Lloop_liveness_end";
+      Backend.Ir.ILoad (2, Backend.Ir.Imm 0);
+      Backend.Ir.IReturn (Some 2);
+    ];
+    temp_count = 3;
+  } in
+  let locations, _, _ = Backend.Codegen.allocate_registers loop_ir in
+  (match Hashtbl.find locations 0, Hashtbl.find locations 1 with
+   | Backend.Codegen.Reg a, Backend.Codegen.Reg b when a = b ->
+     failwith "loop-invariant value shares a register across the backedge"
+   | _ -> ());
+
+  let params_ir : Backend.Ir.func_ir = {
+    name = "parameter_homes";
+    ret_type = Ast.IntRet;
+    params = ["live"; "unused"];
+    locals = [];
+    body = [Backend.Ir.IReturn (Some 0)];
+    temp_count = 2;
+  } in
+  let locations, _, _ = Backend.Codegen.allocate_registers params_ir in
+  (match Hashtbl.find locations 0, Hashtbl.find locations 1 with
+   | Backend.Codegen.Reg a, Backend.Codegen.Reg b when a = b ->
+     failwith "parameter prologue writes share a register home"
+   | _ -> ());
+
   let assembly =
     compile "int main() { int x = 1; int y = 2; return x + y; }"
   in

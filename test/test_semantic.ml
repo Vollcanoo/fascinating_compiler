@@ -1,5 +1,3 @@
-open Ast
-
 let parse source =
   let lexbuf = Lexing.from_string source in
   Frontend.Parser.comp_unit Frontend.Lexer.read lexbuf
@@ -7,12 +5,13 @@ let parse source =
 let check source = Analysis.Semantic.check (parse source)
 
 let expect_error source =
-  try
-    check source;
-    failwith "expected semantic error"
-  with
-  | Failure "expected semantic error" as e -> raise e
-  | Failure _ -> ()
+  let failed =
+    try
+      check source;
+      false
+    with Failure _ -> true
+  in
+  if not failed then failwith "expected semantic error"
 
 let find_global name (program : Backend.Ir.program) =
   List.find_opt

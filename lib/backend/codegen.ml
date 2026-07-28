@@ -22,14 +22,16 @@
  *   low address
  *
  * Register allocation strategy:
- *   Linear scan over conservative live intervals. Values are kept in
- *   callee-saved registers s1-s11 across calls; only excess values spill.
+ *   CFG liveness analysis plus interference-graph coloring. Values are kept
+ *   in callee-saved registers s1-s11 across calls; only excess values spill.
  *   Spill slots use s0-relative addressing so call-time sp adjustments do
  *   not invalidate their addresses.
  *)
 
 open Ir
 open Ast
+
+module IntSet = Set.Make (Int)
 
 type emit_ctx = {
   out : Buffer.t;
@@ -46,59 +48,128 @@ let buf_emit ctx fmt = Printf.bprintf ctx.out fmt
 
 let align16 n = (n + 15) land (lnot 15)
 
-let instr_temps = function
-  | ILoad (d, Imm _) | ILoad (d, Name _) | ILoadGlobal (d, _) -> [d]
-  | ILoad (d, Temp s) | IUnaryOp (d, _, s) -> [d; s]
-  | IStoreGlobal (_, s) | IBranchTrue (s, _) | IBranchFalse (s, _) -> [s]
-  | IBinOp (d, _, l, r) -> [d; l; r]
-  | ICall (d, _, args) -> d :: args
-  | ICallVoid (_, args) -> args
-  | IReturn (Some s) -> [s]
-  | ILabel _ | IJump _ | IReturn None | IComment _ -> []
+let set_of_list xs =
+  List.fold_left (fun set x -> IntSet.add x set) IntSet.empty xs
 
-let allocate_registers func =
-  let first = Array.make func.temp_count max_int in
-  let last = Array.make func.temp_count min_int in
-  List.iteri (fun i _ ->
-    if i < func.temp_count then begin first.(i) <- -1; last.(i) <- -1 end
-  ) func.params;
-  List.iteri (fun pos ins ->
-    List.iter (fun t ->
-      if t >= 0 && t < func.temp_count then begin
-        first.(t) <- min first.(t) pos;
-        last.(t) <- max last.(t) pos
+let instr_defs_uses = function
+  | ILoad (d, Imm _) | ILoad (d, Name _) | ILoadGlobal (d, _) ->
+    IntSet.singleton d, IntSet.empty
+  | ILoad (d, Temp s) | IUnaryOp (d, _, s) ->
+    IntSet.singleton d, IntSet.singleton s
+  | IStoreGlobal (_, s) | IBranchTrue (s, _) | IBranchFalse (s, _) ->
+    IntSet.empty, IntSet.singleton s
+  | IBinOp (d, _, l, r) ->
+    IntSet.singleton d, set_of_list [l; r]
+  | ICall (d, _, args) ->
+    IntSet.singleton d, set_of_list args
+  | ICallVoid (_, args) ->
+    IntSet.empty, set_of_list args
+  | IReturn (Some s) ->
+    IntSet.empty, IntSet.singleton s
+  | ILabel _ | IJump _ | IReturn None | IComment _ ->
+    IntSet.empty, IntSet.empty
+
+let allocate_registers (func : func_ir) =
+  let body : instr array = Array.of_list func.body in
+  let count = Array.length body in
+  let labels = Hashtbl.create 16 in
+  Array.iteri (fun i instr ->
+    match instr with
+    | ILabel label -> Hashtbl.replace labels label i
+    | _ -> ()
+  ) body;
+  let next i = if i + 1 < count then [i + 1] else [] in
+  let successors = Array.init count (fun i ->
+    match body.(i) with
+    | IJump label -> [Hashtbl.find labels label]
+    | IBranchTrue (_, label) | IBranchFalse (_, label) ->
+      Hashtbl.find labels label :: next i
+    | IReturn _ -> []
+    | _ -> next i
+  ) in
+  let defs_uses = Array.map instr_defs_uses body in
+  let live_in = Array.make count IntSet.empty in
+  let live_out = Array.make count IntSet.empty in
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    for i = count - 1 downto 0 do
+      let new_out = List.fold_left (fun set succ ->
+        IntSet.union set live_in.(succ)
+      ) IntSet.empty successors.(i) in
+      let defs, uses = defs_uses.(i) in
+      let new_in = IntSet.union uses (IntSet.diff new_out defs) in
+      if not (IntSet.equal new_out live_out.(i)) then begin
+        live_out.(i) <- new_out;
+        changed := true
+      end;
+      if not (IntSet.equal new_in live_in.(i)) then begin
+        live_in.(i) <- new_in;
+        changed := true
       end
-    ) (instr_temps ins)
-  ) func.body;
-  let intervals = ref [] in
-  for t = 0 to func.temp_count - 1 do
-    if first.(t) <> max_int then intervals := (first.(t), last.(t), t) :: !intervals
+    done
   done;
-  let intervals = List.sort compare !intervals in
-  let free = ref ["s1"; "s2"; "s3"; "s4"; "s5"; "s6";
-                  "s7"; "s8"; "s9"; "s10"; "s11"] in
-  let active = ref [] in
+  let adjacency = Array.make func.temp_count IntSet.empty in
+  let add_edge a b =
+    if a <> b && a >= 0 && b >= 0
+       && a < func.temp_count && b < func.temp_count then begin
+      adjacency.(a) <- IntSet.add b adjacency.(a);
+      adjacency.(b) <- IntSet.add a adjacency.(b)
+    end
+  in
+  let add_clique live =
+    IntSet.iter (fun a -> IntSet.iter (fun b -> add_edge a b) live) live
+  in
+  Array.iter add_clique live_in;
+  Array.iter add_clique live_out;
+  (* Code generation still writes dead destinations, so they must not share
+     a home with values that remain live after that instruction. *)
+  Array.iteri (fun i (defs, _) ->
+    IntSet.iter (fun def ->
+      IntSet.iter (fun live -> add_edge def live) live_out.(i)
+    ) defs
+  ) defs_uses;
+  (* Every parameter is copied to its home in the prologue, including unused
+     parameters. Keep those entry writes from overwriting one another. *)
+  let param_temps =
+    List.init (List.length func.params) (fun i -> i) |> set_of_list
+  in
+  add_clique param_temps;
+  let registers = [| "s1"; "s2"; "s3"; "s4"; "s5"; "s6";
+                     "s7"; "s8"; "s9"; "s10"; "s11" |] in
+  let order = List.init func.temp_count (fun i -> i) in
+  let order = List.sort (fun a b ->
+    compare (IntSet.cardinal adjacency.(b)) (IntSet.cardinal adjacency.(a))
+  ) order in
+  let colors = Array.make func.temp_count None in
   let locations = Hashtbl.create func.temp_count in
   let spill_count = ref 0 in
-  let used = ref [] in
-  List.iter (fun (start_pos, end_pos, temp) ->
-    let still_active = ref [] in
-    List.iter (fun (finish, reg) ->
-      if finish < start_pos then free := reg :: !free
-      else still_active := (finish, reg) :: !still_active
-    ) !active;
-    active := !still_active;
-    match !free with
-    | reg :: rest ->
-      free := rest;
-      Hashtbl.add locations temp (Reg reg);
-      if not (List.mem reg !used) then used := reg :: !used;
-      active := (end_pos, reg) :: !active
-    | [] ->
+  List.iter (fun temp ->
+    let unavailable = IntSet.fold (fun neighbor set ->
+      match colors.(neighbor) with
+      | Some color -> IntSet.add color set
+      | None -> set
+    ) adjacency.(temp) IntSet.empty in
+    let rec choose color =
+      if color = Array.length registers then None
+      else if IntSet.mem color unavailable then choose (color + 1)
+      else Some color
+    in
+    match choose 0 with
+    | Some color -> colors.(temp) <- Some color
+    | None ->
       Hashtbl.add locations temp (Spill !spill_count);
       incr spill_count
-  ) intervals;
-  (locations, List.rev !used, !spill_count)
+  ) order;
+  Array.iteri (fun temp color ->
+    match color with
+    | Some index -> Hashtbl.add locations temp (Reg registers.(index))
+    | None -> ()
+  ) colors;
+  let used_regs = Array.to_list registers |> List.filteri (fun index _ ->
+    Array.exists (fun color -> color = Some index) colors
+  ) in
+  locations, used_regs, !spill_count
 
 let compute_frame func =
   let temp_loc, used_regs, spill_count = allocate_registers func in
