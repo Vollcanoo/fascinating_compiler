@@ -22,13 +22,13 @@ let declare_value name value tbl =
   else ST.add_value name value tbl
 
 let declare_global_value name value tbl =
-  if ST.has_global_value name tbl
+  if ST.has_global_value name tbl || ST.has_func name tbl
   then error ("duplicate global declaration of '" ^ name ^ "'")
   else ST.add_value name value tbl
 
 let declare_func fd tbl =
-  if ST.has_func fd.name tbl
-  then error ("duplicate function name '" ^ fd.name ^ "'")
+  if ST.has_func fd.name tbl || ST.has_global_value fd.name tbl
+  then error ("duplicate global declaration of '" ^ fd.name ^ "'")
   else ST.add_func fd.name { ST.ret_type = fd.ret_type; arity = List.length fd.params } tbl
 
 let bool_of_int n = if n = 0 then 0 else 1
@@ -63,11 +63,27 @@ let rec eval_const_expr tbl = function
      | UPlus -> v
      | UMinus -> -v
      | Not -> bool_of_int (if v = 0 then 1 else 0))
+  | Binary (lhs, And, rhs) ->
+    if eval_const_expr tbl lhs = 0 then 0
+    else bool_of_int (eval_const_expr tbl rhs)
+  | Binary (lhs, Or, rhs) ->
+    if eval_const_expr tbl lhs <> 0 then 1
+    else bool_of_int (eval_const_expr tbl rhs)
   | Binary (lhs, op, rhs) ->
     let a = eval_const_expr tbl lhs in
     let b = eval_const_expr tbl rhs in
     eval_bin op a b
   | Call (name, _) -> error ("function call '" ^ name ^ "' is not a compile-time constant")
+
+let rec check_global_initializer tbl = function
+  | IntLit _ -> ()
+  | Var name -> ignore (expect_declared_value name tbl)
+  | Unary (_, e) -> check_global_initializer tbl e
+  | Binary (lhs, _, rhs) ->
+    check_global_initializer tbl lhs;
+    check_global_initializer tbl rhs
+  | Call (name, _) ->
+    error ("function call '" ^ name ^ "' is not allowed in a global initializer")
 
 let rec check_expr tbl = function
   | IntLit _ -> ()
@@ -77,17 +93,28 @@ let rec check_expr tbl = function
     check_expr tbl lhs;
     check_expr tbl rhs
   | Call (name, args) ->
-    let fn = expect_declared_func name tbl in
-    let actual = List.length args in
-    if actual <> fn.ST.arity
-    then
-      error
-        (Printf.sprintf
-           "function '%s' expects %d argument(s), got %d"
-           name
-           fn.ST.arity
-           actual);
-    List.iter (check_expr tbl) args
+    let fn = check_call tbl name args in
+    (match fn.ST.ret_type with
+     | IntRet -> ()
+     | VoidRet ->
+       error ("void function '" ^ name ^ "' cannot be used as a value"))
+
+and check_call tbl name args =
+  (match ST.lookup_value name tbl with
+   | Some _ -> error ("identifier '" ^ name ^ "' is not callable")
+   | None -> ());
+  let fn = expect_declared_func name tbl in
+  let actual = List.length args in
+  if actual <> fn.ST.arity
+  then
+    error
+      (Printf.sprintf
+         "function '%s' expects %d argument(s), got %d"
+         name
+         fn.ST.arity
+         actual);
+  List.iter (check_expr tbl) args;
+  fn
 
 type stmt_info = {
   returns : bool;
@@ -99,6 +126,9 @@ let no_flow = { returns = false; may_break = false }
 let rec check_stmt ret_type loop_depth tbl stmt =
   match stmt with
   | Empty -> tbl, no_flow
+  | ExprStmt (Call (name, args)) ->
+    ignore (check_call tbl name args);
+    tbl, no_flow
   | ExprStmt e ->
     check_expr tbl e;
     tbl, no_flow
@@ -125,11 +155,20 @@ let rec check_stmt ret_type loop_depth tbl stmt =
       | None -> no_flow
       | Some s -> snd (check_stmt ret_type loop_depth tbl s)
     in
-    ( tbl,
-      {
-        returns = then_info.returns && else_info.returns;
-        may_break = then_info.may_break || else_info.may_break;
-      } )
+    let const_cond =
+      try Some (eval_const_expr tbl cond) with Failure _ -> None
+    in
+    let info =
+      match const_cond with
+      | Some 0 -> else_info
+      | Some _ -> then_info
+      | None ->
+        {
+          returns = then_info.returns && else_info.returns;
+          may_break = then_info.may_break || else_info.may_break;
+        }
+    in
+    tbl, info
   | While (cond, body) ->
     check_expr tbl cond;
     let _, body_info = check_stmt ret_type (loop_depth + 1) tbl body in
@@ -195,7 +234,7 @@ let check (cu : comp_unit) : unit =
       let value = eval_const_expr tbl e in
       loop (declare_global_value name (ST.Const value) tbl) rest
     | GlobalVarDecl (name, e) :: rest ->
-      check_expr tbl e;
+      check_global_initializer tbl e;
       loop (declare_global_value name ST.Var tbl) rest
     | FuncDef fd :: rest ->
       let tbl = declare_func fd tbl in

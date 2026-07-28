@@ -15,14 +15,17 @@
  *   +-------------------+ <- old sp = s0
  *   | saved ra          |  s0 - 4
  *   | saved s0 (fp)     |  s0 - 8
- *   | temp spill slots  |  s0 - 12, s0 - 16, ...
+ *   | saved s1-s11      |  only registers used by this function
+ *   | alignment padding |
+ *   | temp spill slots  |  only when register pressure exceeds 11
  *   +-------------------+ <- sp (16-byte aligned)
  *   low address
  *
  * Register allocation strategy:
- *   Simple: all temporaries are mapped to stack slots (spill everything).
- *   Access via s0-relative addressing so sp adjustments during calls
- *   don't invalidate temp slot addresses.
+ *   Linear scan over conservative live intervals. Values are kept in
+ *   callee-saved registers s1-s11 across calls; only excess values spill.
+ *   Spill slots use s0-relative addressing so call-time sp adjustments do
+ *   not invalidate their addresses.
  *)
 
 open Ir
@@ -32,24 +35,76 @@ type emit_ctx = {
   out : Buffer.t;
   func : func_ir;
   mutable frame_size : int;
-  temp_offset : (int, int) Hashtbl.t;
+  temp_loc : (int, temp_loc) Hashtbl.t;
+  used_regs : string list;
   branch_cnt : int ref;
 }
+
+and temp_loc = Reg of string | Spill of int
 
 let buf_emit ctx fmt = Printf.bprintf ctx.out fmt
 
 let align16 n = (n + 15) land (lnot 15)
 
-let compute_frame func =
-  let num_temps = func.temp_count in
-  let saved_regs = 2 in
-  let total_slots = saved_regs + num_temps in
-  let frame_size = align16 (total_slots * 4) in
-  let temp_offset = Hashtbl.create num_temps in
-  for i = 0 to num_temps - 1 do
-    Hashtbl.replace temp_offset i (i * 4)
+let instr_temps = function
+  | ILoad (d, Imm _) | ILoad (d, Name _) | ILoadGlobal (d, _) -> [d]
+  | ILoad (d, Temp s) | IUnaryOp (d, _, s) -> [d; s]
+  | IStoreGlobal (_, s) | IBranchTrue (s, _) | IBranchFalse (s, _) -> [s]
+  | IBinOp (d, _, l, r) -> [d; l; r]
+  | ICall (d, _, args) -> d :: args
+  | ICallVoid (_, args) -> args
+  | IReturn (Some s) -> [s]
+  | ILabel _ | IJump _ | IReturn None | IComment _ -> []
+
+let allocate_registers func =
+  let first = Array.make func.temp_count max_int in
+  let last = Array.make func.temp_count min_int in
+  List.iteri (fun i _ ->
+    if i < func.temp_count then begin first.(i) <- -1; last.(i) <- -1 end
+  ) func.params;
+  List.iteri (fun pos ins ->
+    List.iter (fun t ->
+      if t >= 0 && t < func.temp_count then begin
+        first.(t) <- min first.(t) pos;
+        last.(t) <- max last.(t) pos
+      end
+    ) (instr_temps ins)
+  ) func.body;
+  let intervals = ref [] in
+  for t = 0 to func.temp_count - 1 do
+    if first.(t) <> max_int then intervals := (first.(t), last.(t), t) :: !intervals
   done;
-  (frame_size, temp_offset)
+  let intervals = List.sort compare !intervals in
+  let free = ref ["s1"; "s2"; "s3"; "s4"; "s5"; "s6";
+                  "s7"; "s8"; "s9"; "s10"; "s11"] in
+  let active = ref [] in
+  let locations = Hashtbl.create func.temp_count in
+  let spill_count = ref 0 in
+  let used = ref [] in
+  List.iter (fun (start_pos, end_pos, temp) ->
+    let still_active = ref [] in
+    List.iter (fun (finish, reg) ->
+      if finish < start_pos then free := reg :: !free
+      else still_active := (finish, reg) :: !still_active
+    ) !active;
+    active := !still_active;
+    match !free with
+    | reg :: rest ->
+      free := rest;
+      Hashtbl.add locations temp (Reg reg);
+      if not (List.mem reg !used) then used := reg :: !used;
+      active := (end_pos, reg) :: !active
+    | [] ->
+      Hashtbl.add locations temp (Spill !spill_count);
+      incr spill_count
+  ) intervals;
+  (locations, List.rev !used, !spill_count)
+
+let compute_frame func =
+  let temp_loc, used_regs, spill_count = allocate_registers func in
+  let saved_slots = 2 + List.length used_regs in
+  let frame_size = align16 ((saved_slots + spill_count) * 4) in
+  (frame_size, temp_loc, used_regs)
 
 let emit_addi ctx rd rs imm =
   if imm >= -2048 && imm <= 2047 then
@@ -78,12 +133,14 @@ let emit_sw ctx reg base offset =
   end
 
 let load_temp ctx reg t =
-  let off = Hashtbl.find ctx.temp_offset t in
-  emit_lw ctx reg "s0" (off - ctx.frame_size)
+  match Hashtbl.find ctx.temp_loc t with
+  | Reg src -> if src <> reg then buf_emit ctx "  mv %s, %s\n" reg src
+  | Spill slot -> emit_lw ctx reg "s0" ((slot * 4) - ctx.frame_size)
 
 let store_temp ctx reg t =
-  let off = Hashtbl.find ctx.temp_offset t in
-  emit_sw ctx reg "s0" (off - ctx.frame_size)
+  match Hashtbl.find ctx.temp_loc t with
+  | Reg dst -> if dst <> reg then buf_emit ctx "  mv %s, %s\n" dst reg
+  | Spill slot -> emit_sw ctx reg "s0" ((slot * 4) - ctx.frame_size)
 
 let load_imm ctx reg n =
   buf_emit ctx "  li %s, %d\n" reg n
@@ -95,9 +152,15 @@ let emit_prologue ctx =
   emit_addi ctx "sp" "sp" (- ctx.frame_size);
   emit_sw ctx "ra" "sp" (ctx.frame_size - 4);
   emit_sw ctx "s0" "sp" (ctx.frame_size - 8);
+  List.iteri (fun i reg ->
+    emit_sw ctx reg "sp" (ctx.frame_size - 12 - (i * 4))
+  ) ctx.used_regs;
   emit_addi ctx "s0" "sp" ctx.frame_size
 
 let emit_epilogue ctx =
+  List.iteri (fun i reg ->
+    emit_lw ctx reg "sp" (ctx.frame_size - 12 - (i * 4))
+  ) ctx.used_regs;
   emit_lw ctx "ra" "sp" (ctx.frame_size - 4);
   emit_lw ctx "s0" "sp" (ctx.frame_size - 8);
   emit_addi ctx "sp" "sp" ctx.frame_size;
@@ -156,7 +219,7 @@ let emit_call ctx dst_opt name args =
       load_temp ctx arg_regs.(i) t
     end else begin
       load_temp ctx "t0" t;
-      buf_emit ctx "  sw t0, %d(sp)\n" ((i - 8) * 4)
+      emit_sw ctx "t0" "sp" ((i - 8) * 4)
     end
   ) args;
   buf_emit ctx "  call %s\n" name;
@@ -225,8 +288,8 @@ let emit_instr ctx instr =
     buf_emit ctx "  # %s\n" s
 
 let emit_func ctx func =
-  let (frame_size, temp_offset) = compute_frame func in
-  let ctx = { ctx with func; frame_size; temp_offset } in
+  let (frame_size, temp_loc, used_regs) = compute_frame func in
+  let ctx = { ctx with func; frame_size; temp_loc; used_regs } in
   buf_emit ctx "\n  .text\n";
   buf_emit ctx "  .globl %s\n" func.name;
   buf_emit ctx "%s:\n" func.name;
@@ -240,8 +303,7 @@ let emit_func ctx func =
       store_temp ctx "t0" i
     end
   ) func.params;
-  List.iter (emit_instr ctx) func.body;
-  emit_epilogue ctx
+  List.iter (emit_instr ctx) func.body
 
 let emit_globals ctx globals =
   let has_data = List.exists (fun g ->
@@ -269,7 +331,8 @@ let emit (out : out_channel) (prog : program) : unit =
     func = { name = ""; ret_type = VoidRet; params = []; locals = [];
              body = []; temp_count = 0 };
     frame_size = 0;
-    temp_offset = Hashtbl.create 0;
+    temp_loc = Hashtbl.create 0;
+    used_regs = [];
     branch_cnt = ref 0;
   } in
   emit_globals ctx prog.globals;

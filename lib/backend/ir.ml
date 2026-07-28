@@ -197,6 +197,9 @@ let gen_store_var env name src_temp =
 let rec gen_stmt env (s : stmt) : unit =
   match s with
   | Empty -> ()
+  | ExprStmt (Call (name, args)) ->
+    let arg_temps = List.map (gen_expr env) args in
+    emit env (ICallVoid (name, arg_temps))
   | ExprStmt e ->
     ignore (gen_expr env e)
   | Assign (name, e) ->
@@ -309,7 +312,23 @@ let rec eval_const_init globals = function
   | Binary (lhs, Mul, rhs) -> eval_const_init globals lhs * eval_const_init globals rhs
   | Binary (lhs, Div, rhs) -> eval_const_init globals lhs / eval_const_init globals rhs
   | Binary (lhs, Mod, rhs) -> eval_const_init globals lhs mod eval_const_init globals rhs
-  | _ -> 0
+  | Binary (lhs, Lt, rhs) ->
+    if eval_const_init globals lhs < eval_const_init globals rhs then 1 else 0
+  | Binary (lhs, Gt, rhs) ->
+    if eval_const_init globals lhs > eval_const_init globals rhs then 1 else 0
+  | Binary (lhs, Le, rhs) ->
+    if eval_const_init globals lhs <= eval_const_init globals rhs then 1 else 0
+  | Binary (lhs, Ge, rhs) ->
+    if eval_const_init globals lhs >= eval_const_init globals rhs then 1 else 0
+  | Binary (lhs, Eq, rhs) ->
+    if eval_const_init globals lhs = eval_const_init globals rhs then 1 else 0
+  | Binary (lhs, Ne, rhs) ->
+    if eval_const_init globals lhs <> eval_const_init globals rhs then 1 else 0
+  | Binary (lhs, And, rhs) ->
+    if eval_const_init globals lhs <> 0 && eval_const_init globals rhs <> 0 then 1 else 0
+  | Binary (lhs, Or, rhs) ->
+    if eval_const_init globals lhs <> 0 || eval_const_init globals rhs <> 0 then 1 else 0
+  | Call _ -> invalid_arg "function call in global initializer"
 
 let lower (cu : comp_unit) : program =
   let globals = ref [] in

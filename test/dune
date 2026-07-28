@@ -5,3 +5,11 @@
 (test
  (name test_parser)
  (libraries ast frontend))
+
+(test
+ (name test_semantic)
+ (libraries ast frontend analysis backend))
+
+(test
+ (name test_codegen)
+ (libraries ast frontend analysis backend))
