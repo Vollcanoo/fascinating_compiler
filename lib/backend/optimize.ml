@@ -73,11 +73,25 @@ let eval_unary (op:A.unary_op) a =
    ===================================================== *)
 
 
+(* common-subexpression keys: commutative ops are normalized so
+   `a+b` and `b+a` hash to the same entry *)
+
+let is_commutative = function
+  | A.Add | A.Mul | A.And | A.Or | A.Eq | A.Ne -> true
+  | A.Sub | A.Div | A.Mod | A.Lt | A.Gt | A.Le | A.Ge -> false
+
+let bin_key (op:A.bin_op) a b =
+  if is_commutative op && b < a then (op, b, a) else (op, a, b)
+
 type env =
 {
   const_table:(int,int) Hashtbl.t;
 
   copy_table:(int,int) Hashtbl.t;
+
+  expr_table:(A.bin_op*int*int,int) Hashtbl.t;
+
+  unary_table:(A.unary_op*int,int) Hashtbl.t;
 }
 
 
@@ -86,6 +100,8 @@ let create_env () =
 {
  const_table=Hashtbl.create 64;
  copy_table=Hashtbl.create 64;
+ expr_table=Hashtbl.create 64;
+ unary_table=Hashtbl.create 64;
 }
 
 
@@ -93,7 +109,9 @@ let create_env () =
 let clear_env env =
 (
  Hashtbl.clear env.const_table;
- Hashtbl.clear env.copy_table
+ Hashtbl.clear env.copy_table;
+ Hashtbl.clear env.expr_table;
+ Hashtbl.clear env.unary_table
 )
 
 
@@ -120,7 +138,36 @@ let kill env t =
  List.iter
    (fun k ->
       Hashtbl.remove env.copy_table k)
-   !dead
+   !dead;
+
+
+
+ (* any cached expression that reads or produced t is now stale *)
+
+ let dead_expr = ref [] in
+
+ Hashtbl.iter
+   (fun (op,a,b) v ->
+      if a=t || b=t || v=t then
+        dead_expr:=(op,a,b)::!dead_expr)
+   env.expr_table;
+
+ List.iter
+   (fun k -> Hashtbl.remove env.expr_table k)
+   !dead_expr;
+
+
+ let dead_unary = ref [] in
+
+ Hashtbl.iter
+   (fun (op,a) v ->
+      if a=t || v=t then
+        dead_unary:=(op,a)::!dead_unary)
+   env.unary_table;
+
+ List.iter
+   (fun k -> Hashtbl.remove env.unary_table k)
+   !dead_unary
 
 
 
@@ -319,9 +366,33 @@ match instr with
     | _ ->
 
 
-        kill env dst;
+        (* common subexpression elimination: reuse an earlier
+           computation of the same (normalized) expression instead
+           of recomputing it *)
 
-        IBinOp(dst,op,a,b)
+        begin match Hashtbl.find_opt env.expr_table (bin_key op a b) with
+
+        | Some existing ->
+
+
+            kill env dst;
+
+            if dst <> existing then
+              Hashtbl.replace env.copy_table dst existing;
+
+            ILoad(dst,Temp existing)
+
+
+        | None ->
+
+
+            kill env dst;
+
+            Hashtbl.replace env.expr_table (bin_key op a b) dst;
+
+            IBinOp(dst,op,a,b)
+
+        end
 
     end
 
@@ -382,9 +453,29 @@ match instr with
     | None ->
 
 
-        kill env dst;
+        begin match Hashtbl.find_opt env.unary_table (op,t) with
 
-        IUnaryOp(dst,op,t)
+        | Some existing ->
+
+
+            kill env dst;
+
+            if dst <> existing then
+              Hashtbl.replace env.copy_table dst existing;
+
+            ILoad(dst,Temp existing)
+
+
+        | None ->
+
+
+            kill env dst;
+
+            Hashtbl.replace env.unary_table (op,t) dst;
+
+            IUnaryOp(dst,op,t)
+
+        end
 
     end
 

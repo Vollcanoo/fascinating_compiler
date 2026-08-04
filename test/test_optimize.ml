@@ -95,6 +95,10 @@ let has_branch (f : func_ir) =
 let has_add (f : func_ir) =
   List.exists (function IBinOp (_, Add, _, _) -> true | _ -> false) f.body
 
+let count_add (f : func_ir) =
+  List.length
+    (List.filter (function IBinOp (_, Add, _, _) -> true | _ -> false) f.body)
+
 let has_imm (f : func_ir) n =
   List.exists (function ILoad (_, Imm m) -> m = n | _ -> false) f.body
 
@@ -209,5 +213,52 @@ let () =
        in
        if not (def_index 6 < def_index 5) then
          failwith "independent z = c+d should have been scheduled ahead of y = x+c");
+
+  test "common subexpression elimination reuses a repeated computation"
+    (fun () ->
+       (* params, not literals: operands must not be compile-time
+          constants, otherwise constant folding alone (already tested
+          above) would collapse everything and this wouldn't exercise
+          CSE at all. `return x + y` is a genuinely separate addition
+          (it still must run), so the reduction is 3 adds -> 2, not
+          3 -> 1. *)
+       let program =
+         lower "int f(int a, int b) { int x = a + b; int y = a + b; return x + y; } int main() { return 0; }"
+       in
+       let before = find_func "f" program in
+       let after = Backend.Optimize.optimize_func before in
+       assert_eq "unoptimized result" 14 (Option.get (interpret before [ 3; 4 ]));
+       assert_eq "optimized result" 14 (Option.get (interpret after [ 3; 4 ]));
+       if count_add after >= count_add before then
+         failwith
+           (Printf.sprintf "expected the repeated a+b to be shared: %d adds before, %d after"
+              (count_add before) (count_add after)));
+
+  test "CSE recognizes commutative reordering (a+b vs b+a)" (fun () ->
+      let program =
+        lower "int f(int a, int b) { int x = a + b; int y = b + a; return x + y; } int main() { return 0; }"
+      in
+      let before = find_func "f" program in
+      let after = Backend.Optimize.optimize_func before in
+      assert_eq "unoptimized result" 14 (Option.get (interpret before [ 3; 4 ]));
+      assert_eq "optimized result" 14 (Option.get (interpret after [ 3; 4 ]));
+      if count_add after >= count_add before then
+        failwith
+          (Printf.sprintf "expected a+b and b+a to be recognized as the same expression: %d adds before, %d after"
+             (count_add before) (count_add after)));
+
+  test "CSE does not reuse a computation once an operand changes" (fun () ->
+      let program =
+        lower "int f(int a, int b) { int x = a + b; a = a + 1; int y = a + b; return x + y; } int main() { return 0; }"
+      in
+      let before = find_func "f" program in
+      let after = Backend.Optimize.optimize_func before in
+      assert_eq "unoptimized result" 15 (Option.get (interpret before [ 3; 4 ]));
+      assert_eq "optimized result" 15 (Option.get (interpret after [ 3; 4 ]));
+      if count_add after <> count_add before then
+        failwith
+          (Printf.sprintf
+             "the second a+b uses a reassigned a and must be recomputed, not reused: %d adds before, %d after"
+             (count_add before) (count_add after)));
 
   Printf.printf "\nAll optimizer tests passed.\n"
