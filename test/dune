@@ -13,3 +13,7 @@
 (test
  (name test_codegen)
  (libraries ast frontend analysis backend))
+
+(test
+ (name test_optimize)
+ (libraries ast frontend analysis backend))
