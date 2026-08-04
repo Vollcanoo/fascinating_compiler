@@ -98,6 +98,12 @@ let has_add (f : func_ir) =
 let has_imm (f : func_ir) n =
   List.exists (function ILoad (_, Imm m) -> m = n | _ -> false) f.body
 
+let instr_def_for_test = function
+  | ILoad (d, _) | ILoadGlobal (d, _)
+  | IBinOp (d, _, _, _) | IUnaryOp (d, _, _) | ICall (d, _, _) -> Some d
+  | ICallVoid _ | IStoreGlobal _ | ILabel _ | IJump _
+  | IBranchTrue _ | IBranchFalse _ | IReturn _ | IComment _ -> None
+
 let () =
   test "run wires up the optimizer (regression: used to be a no-op)"
     (fun () ->
@@ -164,5 +170,44 @@ let () =
       let after = Backend.Optimize.optimize_func before in
       assert_eq "unoptimized result" 10 (Option.get (interpret before []));
       assert_eq "optimized result" 10 (Option.get (interpret after [])));
+
+  test "instruction scheduling fills a load/use gap with independent work"
+    (fun () ->
+       (* x = a+b; y = x+c; z = c+d; return y+z.
+          y's def is a direct, zero-gap consumer of x in program order,
+          while z is independent of both x and y. A hazard-aware
+          scheduler has room to move z's computation ahead of y's to
+          separate x's definition from its use. Hand-built (rather than
+          parsed) so the dependency shape is exact and doesn't depend on
+          how ir.ml happens to number temporaries. *)
+       let before : Backend.Ir.func_ir = {
+         name = "sched";
+         ret_type = Ast.IntRet;
+         params = [ "a"; "b"; "c"; "d" ];
+         locals = [];
+         body = [
+           Backend.Ir.IBinOp (4, Ast.Add, 0, 1); (* x = a + b *)
+           Backend.Ir.IBinOp (5, Ast.Add, 4, 2); (* y = x + c *)
+           Backend.Ir.IBinOp (6, Ast.Add, 2, 3); (* z = c + d *)
+           Backend.Ir.IBinOp (7, Ast.Add, 5, 6); (* y + z *)
+           Backend.Ir.IReturn (Some 7);
+         ];
+         temp_count = 8;
+       } in
+       let after = Backend.Optimize.optimize_func before in
+       assert_eq "unoptimized result" 13 (Option.get (interpret before [ 1; 2; 3; 4 ]));
+       assert_eq "optimized result" 13 (Option.get (interpret after [ 1; 2; 3; 4 ]));
+       let def_index temp =
+         let rec find i = function
+           | [] -> failwith (Printf.sprintf "temp %d not defined in scheduled body" temp)
+           | instr :: rest ->
+             (match instr_def_for_test instr with
+              | Some d when d = temp -> i
+              | _ -> find (i + 1) rest)
+         in
+         find 0 after.Backend.Ir.body
+       in
+       if not (def_index 6 < def_index 5) then
+         failwith "independent z = c+d should have been scheduled ahead of y = x+c");
 
   Printf.printf "\nAll optimizer tests passed.\n"

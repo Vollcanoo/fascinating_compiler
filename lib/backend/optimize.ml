@@ -710,6 +710,116 @@ let rec drop_redundant_jumps = function
 
 
 (* =====================================================
+   Local instruction scheduling (pipeline hazard reduction)
+
+   Codegen turns every ILoad/IBinOp/IUnaryOp into a handful of
+   RISC-V instructions that immediately consume the value it just
+   produced (and, for spilled temps, that value comes straight out
+   of memory). Feeding a result into the very next instruction is
+   exactly the load-use / ALU-use pattern that stalls a simple
+   in-order pipeline. Within a maximal run of pure, control-flow-
+   free instructions we reorder to a different (still valid)
+   topological order of the same dependency DAG, preferring an
+   instruction that is *not* an immediate consumer of the value
+   just scheduled whenever one is ready to run. Calls, global
+   memory access and control flow are left untouched, both as
+   scheduling barriers and in their original relative order, so
+   their side effects and ordering can never be disturbed.
+   ===================================================== *)
+
+let is_schedulable = function
+  | ILoad (_, (Imm _ | Temp _)) -> true
+  | IBinOp _ | IUnaryOp _ -> true
+  | ILoad (_, Name _) | ILoadGlobal _ | IStoreGlobal _
+  | ICall _ | ICallVoid _ | ILabel _ | IJump _
+  | IBranchTrue _ | IBranchFalse _ | IReturn _ | IComment _ -> false
+
+let schedule_segment (instrs : instr array) : instr list =
+  let n = Array.length instrs in
+  if n <= 2 then Array.to_list instrs
+  else begin
+    let preds = Array.make n [] in
+    let succs = Array.make n [] in
+    let add_dep i j =
+      if i <> j && not (List.mem i preds.(j)) then begin
+        preds.(j) <- i :: preds.(j);
+        succs.(i) <- j :: succs.(i)
+      end
+    in
+    (* build the RAW / WAW / WAR dependency DAG over temp ids *)
+    let last_writer = Hashtbl.create 16 in
+    let last_readers = Hashtbl.create 16 in
+    for j = 0 to n - 1 do
+      let uses = instr_uses instrs.(j) in
+      List.iter
+        (fun t ->
+           match Hashtbl.find_opt last_writer t with
+           | Some i -> add_dep i j (* RAW *)
+           | None -> ())
+        uses;
+      (match instr_def instrs.(j) with
+       | Some d ->
+         (match Hashtbl.find_opt last_writer d with
+          | Some i -> add_dep i j (* WAW *)
+          | None -> ());
+         (match Hashtbl.find_opt last_readers d with
+          | Some readers -> List.iter (fun i -> add_dep i j (* WAR *)) readers
+          | None -> ());
+         Hashtbl.replace last_writer d j;
+         Hashtbl.replace last_readers d []
+       | None -> ());
+      List.iter
+        (fun t ->
+           let prev =
+             match Hashtbl.find_opt last_readers t with
+             | Some l -> l
+             | None -> []
+           in
+           Hashtbl.replace last_readers t (j :: prev))
+        uses
+    done;
+    (* greedy list scheduling: among the ready instructions, avoid
+       picking a direct consumer of the instruction just emitted
+       whenever some other ready instruction is available *)
+    let remaining = Array.map List.length preds in
+    let ready = ref (List.filter (fun i -> remaining.(i) = 0) (List.init n Fun.id)) in
+    let out = ref [] in
+    let last = ref (-1) in
+    for _ = 1 to n do
+      let is_direct_consumer i = !last >= 0 && List.mem !last preds.(i) in
+      let chosen =
+        match List.filter (fun i -> not (is_direct_consumer i)) !ready with
+        | i :: _ -> i
+        | [] -> List.hd !ready
+      in
+      ready := List.filter (fun i -> i <> chosen) !ready;
+      out := instrs.(chosen) :: !out;
+      last := chosen;
+      List.iter
+        (fun s ->
+           remaining.(s) <- remaining.(s) - 1;
+           if remaining.(s) = 0 then ready := s :: !ready)
+        succs.(chosen)
+    done;
+    List.rev !out
+  end
+
+let rec schedule_block = function
+  | [] -> []
+  | (x :: rest) as instrs ->
+    if not (is_schedulable x) then x :: schedule_block rest
+    else begin
+      let rec split_segment acc = function
+        | y :: ys when is_schedulable y -> split_segment (y :: acc) ys
+        | tail -> (List.rev acc, tail)
+      in
+      let segment, tail = split_segment [] instrs in
+      schedule_segment (Array.of_list segment) @ schedule_block tail
+    end
+
+
+
+(* =====================================================
    Function
    ===================================================== *)
 
@@ -724,7 +834,11 @@ let optimize_func f =
     |> List.filter (function IComment _ -> false | _ -> true)
   in
   let live = prune_unreachable folded in
-  let body = dead_code_eliminate live |> drop_redundant_jumps in
+  let body =
+    dead_code_eliminate live
+    |> drop_redundant_jumps
+    |> schedule_block
+  in
   { f with body }
 
 
