@@ -77,8 +77,13 @@ let () =
     failwith "allocated callee-saved register is not preserved";
   if not (contains assembly "lw s1,") then
     failwith "allocated callee-saved register is not restored";
-  if not (contains assembly "mv s") then
-    failwith "temporaries were not assigned register homes";
+  (* The arithmetic itself must name callee-saved registers: that shows
+     temporaries got register homes *and* that the result is computed
+     straight into its home. Codegen used to funnel every value through
+     t0/t1/t2 (mv in, compute, mv out), so a plain register-to-register
+     add cost four instructions instead of one. *)
+  if not (contains assembly "add s") then
+    failwith "addition of two register-allocated temporaries is not computed in place";
 
   let assembly =
     compile
@@ -89,4 +94,45 @@ let () =
   if not (contains assembly "call sum") then
     failwith "function call was not emitted";
   if not (contains assembly "(s0)") then
-    failwith "register pressure did not exercise spill/incoming stack slots"
+    failwith "register pressure did not exercise spill/incoming stack slots";
+
+  (* A comparison feeding the branch right after it becomes one compare-
+     and-branch: no slt materializing a 0/1, and no trampoline around an
+     unconditional jump. *)
+  let assembly = compile "int f(int a, int b) { if (a < b) return 1; return 0; } int main() { return 0; }" in
+  if not (contains assembly "bge ") then
+    failwith "if (a < b) did not become a single compare-and-branch";
+  if contains assembly "slt " then
+    failwith "comparison result was materialized instead of folded into the branch";
+  if contains assembly ".Lskip" then
+    failwith "a short branch still went through the far-branch trampoline";
+
+  (* Each comparison must pick the right inverted mnemonic; a mix-up here
+     silently reverses control flow rather than failing to assemble. *)
+  let cmp_branch src expected =
+    let assembly =
+      compile (Printf.sprintf "int f(int a, int b) { if (%s) return 1; return 0; } int main() { return 0; }" src)
+    in
+    if not (contains assembly (expected ^ " ")) then
+      failwith (Printf.sprintf "if (%s) should branch away with %s" src expected)
+  in
+  cmp_branch "a < b" "bge";
+  cmp_branch "a > b" "bge";
+  cmp_branch "a <= b" "blt";
+  cmp_branch "a >= b" "blt";
+  cmp_branch "a == b" "bne";
+  cmp_branch "a != b" "beq";
+
+  (* Conditional branches only reach +-4 KiB. Past that the trampoline
+     has to come back, or the assembler rejects the branch outright. *)
+  let padding =
+    String.concat " " (List.init 400 (fun i -> Printf.sprintf "x = x * %d + a;" (i + 2)))
+  in
+  let assembly =
+    compile
+      (Printf.sprintf
+         "int f(int a, int b) { int x = a; if (a < b) { %s } return x; } int main() { return 0; }"
+         padding)
+  in
+  if not (contains assembly ".Lskip") then
+    failwith "an out-of-range branch must fall back to the far-branch sequence"

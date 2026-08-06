@@ -40,6 +40,11 @@ type emit_ctx = {
   temp_loc : (int, temp_loc) Hashtbl.t;
   used_regs : string list;
   branch_cnt : int ref;
+  (* estimated instruction offset of each label, and of the instruction
+     being emitted, used to tell whether a conditional branch can reach
+     its target directly *)
+  label_off : (string, int) Hashtbl.t;
+  mutable cur_off : int;
 }
 
 and temp_loc = Reg of string | Spill of int
@@ -213,8 +218,24 @@ let store_temp ctx reg t =
   | Reg dst -> if dst <> reg then buf_emit ctx "  mv %s, %s\n" dst reg
   | Spill slot -> emit_sw ctx reg "s0" ((slot * 4) - ctx.frame_size)
 
-let load_imm ctx reg n =
-  buf_emit ctx "  li %s, %d\n" reg n
+(* Register already holding temp [t]. A register-allocated temp is read in
+   place; only a spilled one costs a load into [scratch]. Operating on the
+   allocated register directly is what removes the mv-in/mv-out pair that
+   used to bracket every single computation. *)
+let src_reg ctx t scratch =
+  match Hashtbl.find ctx.temp_loc t with
+  | Reg r -> r
+  | Spill slot ->
+    emit_lw ctx scratch "s0" ((slot * 4) - ctx.frame_size);
+    scratch
+
+(* Register to compute temp [t] into, plus the store-back that a spilled
+   temp needs once the value is there. *)
+let dst_reg ctx t scratch =
+  match Hashtbl.find ctx.temp_loc t with
+  | Reg r -> (r, fun () -> ())
+  | Spill slot ->
+    (scratch, fun () -> emit_sw ctx scratch "s0" ((slot * 4) - ctx.frame_size))
 
 let emit_global_addr ctx reg name =
   buf_emit ctx "  la %s, %s\n" reg name
@@ -238,44 +259,78 @@ let emit_epilogue ctx =
   buf_emit ctx "  ret\n"
 
 let emit_binop ctx dst op lhs rhs =
-  load_temp ctx "t0" lhs;
-  load_temp ctx "t1" rhs;
+  let a = src_reg ctx lhs "t0" in
+  let b = src_reg ctx rhs "t1" in
+  let d, finish = dst_reg ctx dst "t2" in
+  (* Reading both operands and writing the result in one instruction is
+     safe even when [d] aliases [a] or [b]. The two-step forms below only
+     re-read [d] after it already holds the intermediate result. *)
   (match op with
-   | Add -> buf_emit ctx "  add t2, t0, t1\n"
-   | Sub -> buf_emit ctx "  sub t2, t0, t1\n"
-   | Mul -> buf_emit ctx "  mul t2, t0, t1\n"
-   | Div -> buf_emit ctx "  div t2, t0, t1\n"
-   | Mod -> buf_emit ctx "  rem t2, t0, t1\n"
-   | Lt ->  buf_emit ctx "  slt t2, t0, t1\n"
-   | Gt ->  buf_emit ctx "  slt t2, t1, t0\n"
+   | Add -> buf_emit ctx "  add %s, %s, %s\n" d a b
+   | Sub -> buf_emit ctx "  sub %s, %s, %s\n" d a b
+   | Mul -> buf_emit ctx "  mul %s, %s, %s\n" d a b
+   | Div -> buf_emit ctx "  div %s, %s, %s\n" d a b
+   | Mod -> buf_emit ctx "  rem %s, %s, %s\n" d a b
+   | Lt ->  buf_emit ctx "  slt %s, %s, %s\n" d a b
+   | Gt ->  buf_emit ctx "  slt %s, %s, %s\n" d b a
    | Le ->
-     buf_emit ctx "  slt t2, t1, t0\n";
-     buf_emit ctx "  xori t2, t2, 1\n"
+     buf_emit ctx "  slt %s, %s, %s\n" d b a;
+     buf_emit ctx "  xori %s, %s, 1\n" d d
    | Ge ->
-     buf_emit ctx "  slt t2, t0, t1\n";
-     buf_emit ctx "  xori t2, t2, 1\n"
+     buf_emit ctx "  slt %s, %s, %s\n" d a b;
+     buf_emit ctx "  xori %s, %s, 1\n" d d
    | Eq ->
-     buf_emit ctx "  sub t2, t0, t1\n";
-     buf_emit ctx "  seqz t2, t2\n"
+     buf_emit ctx "  sub %s, %s, %s\n" d a b;
+     buf_emit ctx "  seqz %s, %s\n" d d
    | Ne ->
-     buf_emit ctx "  sub t2, t0, t1\n";
-     buf_emit ctx "  snez t2, t2\n"
+     buf_emit ctx "  sub %s, %s, %s\n" d a b;
+     buf_emit ctx "  snez %s, %s\n" d d
    | And ->
-     buf_emit ctx "  snez t0, t0\n";
-     buf_emit ctx "  snez t1, t1\n";
-     buf_emit ctx "  and t2, t0, t1\n"
+     (* both operands must be normalized to 0/1 before the result is
+        written, so these go through scratch: writing [d] first could
+        clobber an operand it aliases *)
+     buf_emit ctx "  snez t0, %s\n" a;
+     buf_emit ctx "  snez t1, %s\n" b;
+     buf_emit ctx "  and %s, t0, t1\n" d
    | Or ->
-     buf_emit ctx "  or t2, t0, t1\n";
-     buf_emit ctx "  snez t2, t2\n");
-  store_temp ctx "t2" dst
+     buf_emit ctx "  or t0, %s, %s\n" a b;
+     buf_emit ctx "  snez %s, t0\n" d);
+  finish ()
 
 let emit_unaryop ctx dst op src =
-  load_temp ctx "t0" src;
+  let s = src_reg ctx src "t0" in
+  let d, finish = dst_reg ctx dst "t2" in
   (match op with
-   | UPlus -> buf_emit ctx "  mv t2, t0\n"
-   | UMinus -> buf_emit ctx "  neg t2, t0\n"
-   | Not ->  buf_emit ctx "  seqz t2, t0\n");
-  store_temp ctx "t2" dst
+   | UPlus -> if d <> s then buf_emit ctx "  mv %s, %s\n" d s
+   | UMinus -> buf_emit ctx "  neg %s, %s\n" d s
+   | Not ->  buf_emit ctx "  seqz %s, %s\n" d s);
+  finish ()
+
+(* A comparison feeding straight into a branch becomes a single compare-
+   and-branch, dropping both the slt and the test of its 0/1 result.
+   [invert] selects the IBranchFalse sense (branch when the comparison
+   does not hold). *)
+let emit_fused_branch ctx op lhs rhs lbl ~invert =
+  let a = src_reg ctx lhs "t0" in
+  let b = src_reg ctx rhs "t1" in
+  let mnemonic, x, y =
+    match op, invert with
+    | Lt, false -> "blt", a, b
+    | Lt, true  -> "bge", a, b
+    | Gt, false -> "blt", b, a
+    | Gt, true  -> "bge", b, a
+    | Le, false -> "bge", b, a
+    | Le, true  -> "blt", b, a
+    | Ge, false -> "bge", a, b
+    | Ge, true  -> "blt", a, b
+    | Eq, false -> "beq", a, b
+    | Eq, true  -> "bne", a, b
+    | Ne, false -> "bne", a, b
+    | Ne, true  -> "beq", a, b
+    | (Add | Sub | Mul | Div | Mod | And | Or), _ ->
+      invalid_arg "emit_fused_branch: not a comparison"
+  in
+  buf_emit ctx "  %s %s, %s, %s\n" mnemonic x y lbl
 
 let emit_call ctx dst_opt name args =
   let nargs = List.length args in
@@ -302,26 +357,92 @@ let emit_call ctx dst_opt name args =
    | Some dst -> store_temp ctx "a0" dst
    | None -> ())
 
+(* A conditional branch reaches +-4 KiB, i.e. +-1024 instructions. The
+   offsets below are upper-bound estimates, so staying well inside that
+   limit keeps the direct form safe; anything further falls back to the
+   inverted-branch-over-jump sequence, which has unlimited range. *)
+let branch_reach_limit = 800
+
+let branch_reaches ctx lbl =
+  match Hashtbl.find_opt ctx.label_off lbl with
+  | Some target -> abs (target - ctx.cur_off) < branch_reach_limit
+  | None -> false
+
+(* Upper bound on the machine instructions one IR instruction expands to.
+   Only used for the reachability estimate above; over-estimating merely
+   gives up a direct branch, it can never produce wrong code. *)
+let max_expansion used_reg_count = function
+  | ILabel _ | IComment _ -> 0
+  | IJump _ -> 1
+  | ILoad (_, Imm _) | ILoad (_, Temp _) -> 4
+  | ILoad (_, Name _) | ILoadGlobal _ | IStoreGlobal _ -> 7
+  | IBinOp _ -> 12
+  | IUnaryOp _ -> 9
+  | IBranchTrue _ | IBranchFalse _ -> 7
+  | ICall (_, _, args) | ICallVoid (_, args) -> 12 + (3 * List.length args)
+  | IReturn _ -> 12 + (3 * used_reg_count)
+
+let instr_offsets used_reg_count (body : instr array) =
+  let offsets = Array.make (Array.length body + 1) 0 in
+  Array.iteri (fun i instr ->
+    offsets.(i + 1) <- offsets.(i) + max_expansion used_reg_count instr
+  ) body;
+  offsets
+
+let label_offsets offsets (body : instr array) =
+  let table = Hashtbl.create 16 in
+  Array.iteri (fun i instr ->
+    match instr with
+    | ILabel l -> Hashtbl.replace table l offsets.(i)
+    | _ -> ()
+  ) body;
+  table
+
+(* How many instructions read each temp, so a comparison whose result is
+   consumed only by the branch right after it can be fused away. *)
+let use_counts (body : instr array) =
+  let counts = Hashtbl.create 64 in
+  Array.iter (fun instr ->
+    let _, uses = instr_defs_uses instr in
+    IntSet.iter (fun t ->
+      Hashtbl.replace counts t (1 + Option.value ~default:0 (Hashtbl.find_opt counts t))
+    ) uses
+  ) body;
+  counts
+
+let emit_cond_branch ctx t lbl ~invert =
+  let r = src_reg ctx t "t0" in
+  if branch_reaches ctx lbl then
+    buf_emit ctx "  %s %s, %s\n" (if invert then "beqz" else "bnez") r lbl
+  else begin
+    let n = !(ctx.branch_cnt) in
+    ctx.branch_cnt := n + 1;
+    let skip = Printf.sprintf ".Lskip%d" n in
+    buf_emit ctx "  %s %s, %s\n" (if invert then "bnez" else "beqz") r skip;
+    buf_emit ctx "  j %s\n" lbl;
+    buf_emit ctx "%s:\n" skip
+  end
+
 let emit_instr ctx instr =
   match instr with
   | ILoad (dst, Imm n) ->
-    load_imm ctx "t0" n;
-    store_temp ctx "t0" dst
+    let d, finish = dst_reg ctx dst "t0" in
+    buf_emit ctx "  li %s, %d\n" d n;
+    finish ()
   | ILoad (dst, Temp src) ->
-    load_temp ctx "t0" src;
-    store_temp ctx "t0" dst
-  | ILoad (dst, Name name) ->
-    emit_global_addr ctx "t0" name;
-    buf_emit ctx "  lw t0, 0(t0)\n";
-    store_temp ctx "t0" dst
-  | ILoadGlobal (dst, name) ->
-    emit_global_addr ctx "t0" name;
-    buf_emit ctx "  lw t0, 0(t0)\n";
-    store_temp ctx "t0" dst
-  | IStoreGlobal (name, src) ->
-    load_temp ctx "t0" src;
+    let s = src_reg ctx src "t0" in
+    (match Hashtbl.find ctx.temp_loc dst with
+     | Reg d -> if d <> s then buf_emit ctx "  mv %s, %s\n" d s
+     | Spill slot -> emit_sw ctx s "s0" ((slot * 4) - ctx.frame_size))
+  | ILoad (dst, Name name) | ILoadGlobal (dst, name) ->
+    let d, finish = dst_reg ctx dst "t0" in
     emit_global_addr ctx "t1" name;
-    buf_emit ctx "  sw t0, 0(t1)\n"
+    buf_emit ctx "  lw %s, 0(t1)\n" d;
+    finish ()
+  | IStoreGlobal (name, src) ->
+    let s = src_reg ctx src "t0" in
+    emit_global_addr ctx "t1" name;
+    buf_emit ctx "  sw %s, 0(t1)\n" s
   | IBinOp (dst, op, lhs, rhs) ->
     emit_binop ctx dst op lhs rhs
   | IUnaryOp (dst, op, src) ->
@@ -334,22 +455,8 @@ let emit_instr ctx instr =
     buf_emit ctx "%s:\n" lbl
   | IJump lbl ->
     buf_emit ctx "  j %s\n" lbl
-  | IBranchTrue (t, lbl) ->
-    load_temp ctx "t0" t;
-    let n = !(ctx.branch_cnt) in
-    ctx.branch_cnt := n + 1;
-    let skip = Printf.sprintf ".Lskip%d" n in
-    buf_emit ctx "  beqz t0, %s\n" skip;
-    buf_emit ctx "  j %s\n" lbl;
-    buf_emit ctx "%s:\n" skip
-  | IBranchFalse (t, lbl) ->
-    load_temp ctx "t0" t;
-    let n = !(ctx.branch_cnt) in
-    ctx.branch_cnt := n + 1;
-    let skip = Printf.sprintf ".Lskip%d" n in
-    buf_emit ctx "  bnez t0, %s\n" skip;
-    buf_emit ctx "  j %s\n" lbl;
-    buf_emit ctx "%s:\n" skip
+  | IBranchTrue (t, lbl) -> emit_cond_branch ctx t lbl ~invert:false
+  | IBranchFalse (t, lbl) -> emit_cond_branch ctx t lbl ~invert:true
   | IReturn opt ->
     (match opt with
      | Some t -> load_temp ctx "a0" t
@@ -358,9 +465,18 @@ let emit_instr ctx instr =
   | IComment s ->
     buf_emit ctx "  # %s\n" s
 
+let is_comparison = function
+  | Lt | Gt | Le | Ge | Eq | Ne -> true
+  | Add | Sub | Mul | Div | Mod | And | Or -> false
+
 let emit_func ctx func =
   let (frame_size, temp_loc, used_regs) = compute_frame func in
-  let ctx = { ctx with func; frame_size; temp_loc; used_regs } in
+  let body = Array.of_list func.body in
+  let offsets = instr_offsets (List.length used_regs) body in
+  let label_off = label_offsets offsets body in
+  let ctx =
+    { ctx with func; frame_size; temp_loc; used_regs; label_off; cur_off = 0 }
+  in
   buf_emit ctx "\n  .text\n";
   buf_emit ctx "  .globl %s\n" func.name;
   buf_emit ctx "%s:\n" func.name;
@@ -374,7 +490,36 @@ let emit_func ctx func =
       store_temp ctx "t0" i
     end
   ) func.params;
-  List.iter (emit_instr ctx) func.body
+  let uses = use_counts body in
+  let count = Array.length body in
+  let i = ref 0 in
+  while !i < count do
+    ctx.cur_off <- offsets.(!i);
+    let fused =
+      (* a comparison whose only reader is the branch immediately after it *)
+      if !i + 1 >= count then None
+      else
+        match body.(!i), body.(!i + 1) with
+        | IBinOp (t, op, lhs, rhs), IBranchTrue (t', lbl)
+          when t = t' && is_comparison op
+               && Hashtbl.find_opt uses t = Some 1
+               && branch_reaches ctx lbl ->
+          Some (op, lhs, rhs, lbl, false)
+        | IBinOp (t, op, lhs, rhs), IBranchFalse (t', lbl)
+          when t = t' && is_comparison op
+               && Hashtbl.find_opt uses t = Some 1
+               && branch_reaches ctx lbl ->
+          Some (op, lhs, rhs, lbl, true)
+        | _ -> None
+    in
+    match fused with
+    | Some (op, lhs, rhs, lbl, invert) ->
+      emit_fused_branch ctx op lhs rhs lbl ~invert;
+      i := !i + 2
+    | None ->
+      emit_instr ctx body.(!i);
+      incr i
+  done
 
 let emit_globals ctx globals =
   let has_data = List.exists (fun g ->
@@ -405,6 +550,8 @@ let emit (out : out_channel) (prog : program) : unit =
     temp_loc = Hashtbl.create 0;
     used_regs = [];
     branch_cnt = ref 0;
+    label_off = Hashtbl.create 0;
+    cur_off = 0;
   } in
   emit_globals ctx prog.globals;
   List.iter (emit_func ctx) prog.funcs;
