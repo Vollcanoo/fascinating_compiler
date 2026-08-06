@@ -261,4 +261,50 @@ let () =
              "the second a+b uses a reassigned a and must be recomputed, not reused: %d adds before, %d after"
              (count_add before) (count_add after)));
 
+  (* Loop rotation moves the test below the body, so the entry jump is the
+     only thing keeping a loop whose condition starts false from running
+     its body once. Getting that wrong is silent: the code still
+     assembles and still terminates, it just computes the wrong answer. *)
+  test "rotated loop with a false condition never enters the body" (fun () ->
+      let program =
+        lower "int f(int n) { int s = 0; while (n > 0) { s = s + 100; n = n - 1; } return s; } int main() { return 0; }"
+      in
+      let before = find_func "f" program in
+      let after = Backend.Optimize.optimize_func before in
+      assert_eq "unoptimized, zero iterations" 0 (Option.get (interpret before [ 0 ]));
+      assert_eq "optimized, zero iterations" 0 (Option.get (interpret after [ 0 ]));
+      assert_eq "unoptimized, three iterations" 300 (Option.get (interpret before [ 3 ]));
+      assert_eq "optimized, three iterations" 300 (Option.get (interpret after [ 3 ])));
+
+  test "break still leaves a rotated loop" (fun () ->
+      let program =
+        lower "int f(int n) { int s = 0; while (1) { if (s >= n) break; s = s + 1; } return s; } int main() { return 0; }"
+      in
+      let before = find_func "f" program in
+      let after = Backend.Optimize.optimize_func before in
+      assert_eq "unoptimized" 5 (Option.get (interpret before [ 5 ]));
+      assert_eq "optimized" 5 (Option.get (interpret after [ 5 ])));
+
+  test "continue still re-tests a rotated loop" (fun () ->
+      (* sums only the odd values below n, so a continue that skipped the
+         test (or the increment) would change the total *)
+      let program =
+        lower "int f(int n) { int i = 0; int s = 0; while (i < n) { i = i + 1; if (i % 2 == 0) continue; s = s + i; } return s; } int main() { return 0; }"
+      in
+      let before = find_func "f" program in
+      let after = Backend.Optimize.optimize_func before in
+      assert_eq "unoptimized" 25 (Option.get (interpret before [ 10 ]));
+      assert_eq "optimized" 25 (Option.get (interpret after [ 10 ])));
+
+  test "nested loops rotate independently" (fun () ->
+      let program =
+        lower "int f(int n) { int s = 0; int i = 0; while (i < n) { int j = 0; while (j < n) { s = s + 1; j = j + 1; } i = i + 1; } return s; } int main() { return 0; }"
+      in
+      let before = find_func "f" program in
+      let after = Backend.Optimize.optimize_func before in
+      assert_eq "unoptimized" 49 (Option.get (interpret before [ 7 ]));
+      assert_eq "optimized" 49 (Option.get (interpret after [ 7 ]));
+      assert_eq "unoptimized, outer never runs" 0 (Option.get (interpret before [ 0 ]));
+      assert_eq "optimized, outer never runs" 0 (Option.get (interpret after [ 0 ])));
+
   Printf.printf "\nAll optimizer tests passed.\n"

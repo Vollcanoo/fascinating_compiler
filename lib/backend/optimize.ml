@@ -911,11 +911,81 @@ let rec schedule_block = function
 
 
 (* =====================================================
+   Loop rotation
+
+   `while` lowers to a test at the top and an unconditional jump back
+   to it, so every iteration pays two control transfers: the test
+   falling through, and the jump home. Moving the test to the bottom
+   leaves one taken branch per iteration and drops the jump:
+
+     jump COND            COND:  <test>
+     TOP:  <body>   <==   branch-if-false END
+     COND: <test>         <body>
+     branch-if-true TOP   jump COND
+     END:                 END:
+
+   Both labels keep their original meaning -- COND still re-evaluates
+   the test and END still sits past the loop -- so `continue` and
+   `break` inside the body need no adjustment.
+   ===================================================== *)
+
+let rotate_counter = ref 0
+
+(* Condition code must be straight-line: a label inside it could be
+   jumped to from elsewhere, and moving it below the body would change
+   where that lands. Short-circuit conditions (&&, ||) build their own
+   labels and so are left alone. *)
+let rec take_cond acc = function
+  | IBranchFalse (c, endl) :: rest -> Some (List.rev acc, c, endl, rest)
+  | (ILabel _ | IJump _ | IBranchTrue _ | IReturn _) :: _ -> None
+  | x :: rest -> take_cond (x :: acc) rest
+  | [] -> None
+
+(* Labels are globally unique, so matching the loop's own back edge
+   cannot pick up a nested loop's. *)
+let rec take_body cond endl acc = function
+  | IJump l :: ILabel e :: rest when l = cond && e = endl ->
+    Some (List.rev acc, rest)
+  | x :: rest -> take_body cond endl (x :: acc) rest
+  | [] -> None
+
+let rec rotate_loops instrs =
+  match instrs with
+  | ILabel cond :: rest ->
+    let rotated =
+      match take_cond [] rest with
+      | Some (cond_instrs, c, endl, after) ->
+        (match take_body cond endl [] after with
+         | Some (body, tail) ->
+           let n = !rotate_counter in
+           incr rotate_counter;
+           let top = Printf.sprintf ".Lloop_top%d" n in
+           Some
+             (List.concat
+                [ [ IJump cond; ILabel top ];
+                  rotate_loops body;
+                  [ ILabel cond ];
+                  cond_instrs;
+                  [ IBranchTrue (c, top); ILabel endl ];
+                  rotate_loops tail ])
+         | None -> None)
+      | None -> None
+    in
+    (match rotated with
+     | Some result -> result
+     | None -> ILabel cond :: rotate_loops rest)
+  | x :: rest -> x :: rotate_loops rest
+  | [] -> []
+
+
+
+(* =====================================================
    Function
    ===================================================== *)
 
 let optimize_func f =
-  let cfg = Cfg.build f.body in
+  (* rotation matches the shape lowering produces, so it runs first *)
+  let cfg = Cfg.build (rotate_loops f.body) in
   let blocks =
     Array.map optimize_block cfg.blocks
   in

@@ -45,6 +45,8 @@ type emit_ctx = {
      its target directly *)
   label_off : (string, int) Hashtbl.t;
   mutable cur_off : int;
+  (* constants folded into instruction immediates, so never materialized *)
+  imm_temps : (int, int) Hashtbl.t;
 }
 
 and temp_loc = Reg of string | Spill of int
@@ -176,11 +178,85 @@ let allocate_registers (func : func_ir) =
   ) in
   locations, used_regs, !spill_count
 
-let compute_frame func =
-  let temp_loc, used_regs, spill_count = allocate_registers func in
+let immediate_fits n = n >= -2048 && n <= 2047
+
+(* Constants small enough to ride along inside an instruction, and read
+   only by instructions that have an immediate form. These need no
+   register at all: the load disappears and every use folds the value in.
+   addi is the only immediate form used here, so a candidate survives
+   only where it is an addend of an add, or the subtrahend of a sub
+   (folded as its negation); any other reader forces it into a register. *)
+let immediate_temps (body : instr list) =
+  let candidates = Hashtbl.create 16 in
+  let def_count = Hashtbl.create 16 in
+  List.iter (fun instr ->
+    let defs, _ = instr_defs_uses instr in
+    IntSet.iter (fun d ->
+      Hashtbl.replace def_count d
+        (1 + Option.value ~default:0 (Hashtbl.find_opt def_count d))
+    ) defs
+  ) body;
+  List.iter (fun instr ->
+    match instr with
+    | ILoad (t, Imm n) when immediate_fits n -> Hashtbl.replace candidates t n
+    | _ -> ()
+  ) body;
+  (* a temp written more than once has no single value to fold *)
+  Hashtbl.iter (fun t _ ->
+    if Hashtbl.find_opt def_count t <> Some 1 then Hashtbl.remove candidates t
+  ) (Hashtbl.copy candidates);
+  let is_const t = Hashtbl.mem candidates t in
+  List.iter (fun instr ->
+    let allowed =
+      match instr with
+      | ILoad (_, Imm _) -> []
+      | IBinOp (_, Add, a, b) ->
+        (* only one side can become the immediate *)
+        if is_const a && is_const b then []
+        else if is_const b then [b]
+        else if is_const a then [a]
+        else []
+      | IBinOp (_, Sub, a, b) ->
+        if is_const b && not (is_const a) then [b] else []
+      | _ -> []
+    in
+    let _, uses = instr_defs_uses instr in
+    IntSet.iter (fun u ->
+      if not (List.mem u allowed) then Hashtbl.remove candidates u
+    ) uses
+  ) body;
+  (* a subtrahend folds as addi with the negation, which must fit too *)
+  List.iter (fun instr ->
+    match instr with
+    | IBinOp (_, Sub, _, b) ->
+      (match Hashtbl.find_opt candidates b with
+       | Some n when not (immediate_fits (- n)) -> Hashtbl.remove candidates b
+       | _ -> ())
+    | _ -> ()
+  ) body;
+  candidates
+
+(* Body as the register allocator should see it: folded constants no
+   longer have a definition, and the adds that absorb them read one
+   operand instead of two. UPlus stands in because it carries exactly the
+   def/use shape of the addi that will be emitted. *)
+let allocation_view imm_temps (body : instr list) =
+  List.filter_map (fun instr ->
+    match instr with
+    | ILoad (t, Imm _) when Hashtbl.mem imm_temps t -> None
+    | IBinOp (d, Add, a, b) when Hashtbl.mem imm_temps b -> Some (IUnaryOp (d, UPlus, a))
+    | IBinOp (d, Add, a, b) when Hashtbl.mem imm_temps a -> Some (IUnaryOp (d, UPlus, b))
+    | IBinOp (d, Sub, a, b) when Hashtbl.mem imm_temps b -> Some (IUnaryOp (d, UPlus, a))
+    | _ -> Some instr
+  ) body
+
+let compute_frame (func : func_ir) =
+  let imm_temps = immediate_temps func.body in
+  let alloc_func = { func with body = allocation_view imm_temps func.body } in
+  let temp_loc, used_regs, spill_count = allocate_registers alloc_func in
   let saved_slots = 2 + List.length used_regs in
   let frame_size = align16 ((saved_slots + spill_count) * 4) in
-  (frame_size, temp_loc, used_regs)
+  (frame_size, temp_loc, used_regs, imm_temps)
 
 let emit_addi ctx rd rs imm =
   if imm >= -2048 && imm <= 2047 then
@@ -423,8 +499,23 @@ let emit_cond_branch ctx t lbl ~invert =
     buf_emit ctx "%s:\n" skip
   end
 
+(* dst = src + n, the folded form of a load-constant plus an add *)
+let emit_addi_temp ctx dst src n =
+  let s = src_reg ctx src "t0" in
+  let d, finish = dst_reg ctx dst "t2" in
+  buf_emit ctx "  addi %s, %s, %d\n" d s n;
+  finish ()
+
 let emit_instr ctx instr =
   match instr with
+  (* a constant that every reader folds in is never materialized *)
+  | ILoad (dst, Imm _) when Hashtbl.mem ctx.imm_temps dst -> ()
+  | IBinOp (dst, Add, a, b) when Hashtbl.mem ctx.imm_temps b ->
+    emit_addi_temp ctx dst a (Hashtbl.find ctx.imm_temps b)
+  | IBinOp (dst, Add, a, b) when Hashtbl.mem ctx.imm_temps a ->
+    emit_addi_temp ctx dst b (Hashtbl.find ctx.imm_temps a)
+  | IBinOp (dst, Sub, a, b) when Hashtbl.mem ctx.imm_temps b ->
+    emit_addi_temp ctx dst a (- (Hashtbl.find ctx.imm_temps b))
   | ILoad (dst, Imm n) ->
     let d, finish = dst_reg ctx dst "t0" in
     buf_emit ctx "  li %s, %d\n" d n;
@@ -470,12 +561,13 @@ let is_comparison = function
   | Add | Sub | Mul | Div | Mod | And | Or -> false
 
 let emit_func ctx func =
-  let (frame_size, temp_loc, used_regs) = compute_frame func in
+  let (frame_size, temp_loc, used_regs, imm_temps) = compute_frame func in
   let body = Array.of_list func.body in
   let offsets = instr_offsets (List.length used_regs) body in
   let label_off = label_offsets offsets body in
   let ctx =
-    { ctx with func; frame_size; temp_loc; used_regs; label_off; cur_off = 0 }
+    { ctx with
+      func; frame_size; temp_loc; used_regs; label_off; cur_off = 0; imm_temps }
   in
   buf_emit ctx "\n  .text\n";
   buf_emit ctx "  .globl %s\n" func.name;
@@ -552,6 +644,7 @@ let emit (out : out_channel) (prog : program) : unit =
     branch_cnt = ref 0;
     label_off = Hashtbl.create 0;
     cur_off = 0;
+    imm_temps = Hashtbl.create 0;
   } in
   emit_globals ctx prog.globals;
   List.iter (emit_func ctx) prog.funcs;
