@@ -56,6 +56,9 @@ let () =
      failwith "loop-invariant value shares a register across the backedge"
    | _ -> ());
 
+  (* A parameter the body never reads needs no home: giving it one costs
+     a callee-saved register that the prologue and epilogue then save and
+     restore for a value nobody looks at. *)
   let params_ir : Backend.Ir.func_ir = {
     name = "parameter_homes";
     ret_type = Ast.IntRet;
@@ -64,26 +67,63 @@ let () =
     body = [Backend.Ir.IReturn (Some 0)];
     temp_count = 2;
   } in
-  let locations, _, _ = Backend.Codegen.allocate_registers params_ir in
+  let locations, saved, _ = Backend.Codegen.allocate_registers params_ir in
+  if Hashtbl.mem locations 1 then
+    failwith "an unread parameter was given a register home";
+  if List.length saved > 1 then
+    failwith "an unread parameter forced extra callee-saved registers";
+
+  (* Parameters that are read still land in distinct homes: they are all
+     written at entry, so sharing one would lose an argument. *)
+  let both_used_ir : Backend.Ir.func_ir = {
+    name = "both_used";
+    ret_type = Ast.IntRet;
+    params = ["a"; "b"];
+    locals = [];
+    body = [
+      Backend.Ir.IBinOp (2, Ast.Add, 0, 1);
+      Backend.Ir.IReturn (Some 2);
+    ];
+    temp_count = 3;
+  } in
+  let locations, _, _ = Backend.Codegen.allocate_registers both_used_ir in
   (match Hashtbl.find locations 0, Hashtbl.find locations 1 with
    | Backend.Codegen.Reg a, Backend.Codegen.Reg b when a = b ->
      failwith "parameter prologue writes share a register home"
    | _ -> ());
 
+  (* Nothing in a leaf function outlives a call, because there are none.
+     Everything can therefore live in caller-saved registers, and the
+     function needs no frame, no saves and no restores whatsoever. *)
   let assembly =
-    compile "int main() { int x = 1; int y = 2; return x + y; }"
+    compile "int leaf(int a, int b) { return a * b + 7; } int main() { return 0; }"
+  in
+  if contains assembly "sw s" then
+    failwith "a leaf function preserved a callee-saved register it need not use";
+  if contains assembly "sw ra" then
+    failwith "a leaf function saved a return address it never clobbers";
+  if contains assembly "addi sp" then
+    failwith "a leaf function needing no stack still built a frame";
+  (* Computed straight into the argument registers: codegen used to
+     funnel every value through t0/t1/t2 (mv in, compute, mv out), so a
+     register-to-register multiply cost four instructions instead of one. *)
+  if not (contains assembly "mul a") then
+    failwith "leaf arithmetic was not computed in the argument registers";
+
+  (* A value that outlives a call cannot sit in a caller-saved register,
+     so it gets a callee-saved one, which then has to be preserved. *)
+  let assembly =
+    compile
+      ("int g(int x) { return x; }"
+       ^ "int f(int a) { int keep = a + 5; return g(a) + keep; }"
+       ^ "int main() { return 0; }")
   in
   if not (contains assembly "sw s1,") then
-    failwith "allocated callee-saved register is not preserved";
+    failwith "a value live across a call was not given a preserved register";
   if not (contains assembly "lw s1,") then
-    failwith "allocated callee-saved register is not restored";
-  (* The arithmetic itself must name callee-saved registers: that shows
-     temporaries got register homes *and* that the result is computed
-     straight into its home. Codegen used to funnel every value through
-     t0/t1/t2 (mv in, compute, mv out), so a plain register-to-register
-     add cost four instructions instead of one. *)
-  if not (contains assembly "add s") then
-    failwith "addition of two register-allocated temporaries is not computed in place";
+    failwith "a preserved register was not restored";
+  if not (contains assembly "sw ra,") then
+    failwith "a function that calls did not save its return address";
 
   let assembly =
     compile
@@ -93,8 +133,49 @@ let () =
   in
   if not (contains assembly "call sum") then
     failwith "function call was not emitted";
-  if not (contains assembly "(s0)") then
-    failwith "register pressure did not exercise spill/incoming stack slots";
+
+  (* A power-of-two factor becomes a shift, and the factor itself never
+     reaches a register. Only the low 32 bits matter, so this is right
+     for negative values too. *)
+  let assembly = compile "int f(int a) { return a * 8; } int main() { return 0; }" in
+  if not (contains assembly "slli") then
+    failwith "multiplying by 8 did not become a shift";
+  if contains assembly "mul " then
+    failwith "the multiply survived alongside the shift";
+  (* the factor itself never appears as an operand; the shift names 3 *)
+  if contains assembly ", 8" then
+    failwith "the power-of-two factor was still materialized";
+
+  (* A factor that is not a power of two still has to multiply. *)
+  let assembly = compile "int f(int a) { return a * 7; } int main() { return 0; }" in
+  if not (contains assembly "mul ") then
+    failwith "multiplying by 7 should still use mul";
+
+  (* Twenty-five values live at once exceed the twenty-two allocatable
+     registers, so the allocator has to spill. Checked through the
+     allocator rather than the assembly text: spill slots and saved
+     registers are both plain sp offsets now and read the same. *)
+  let wide_ir =
+    let count = 25 in
+    let decls =
+      List.init count (fun i -> Printf.sprintf "int v%d = a + %d;" i (i + 1))
+    in
+    let total =
+      String.concat " + " (List.init count (fun i -> Printf.sprintf "v%d" i))
+    in
+    let ast =
+      parse
+        (Printf.sprintf "int wide(int a) { %s return %s; } int main() { return 0; }"
+           (String.concat " " decls) total)
+    in
+    Analysis.Semantic.check ast;
+    List.find
+      (fun (f : Backend.Ir.func_ir) -> f.name = "wide")
+      (Backend.Ir.lower ast).funcs
+  in
+  let _, _, spill_count = Backend.Codegen.allocate_registers wide_ir in
+  if spill_count = 0 then
+    failwith "register pressure did not exercise spilling";
 
   (* A comparison feeding the branch right after it becomes one compare-
      and-branch: no slt materializing a 0/1, and no trampoline around an

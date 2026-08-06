@@ -307,4 +307,57 @@ let () =
       assert_eq "unoptimized, outer never runs" 0 (Option.get (interpret before [ 0 ]));
       assert_eq "optimized, outer never runs" 0 (Option.get (interpret after [ 0 ])));
 
+  (* Identities settle the result from one operand alone, so they apply
+     where constant folding cannot: the other side stays unknown. *)
+  test "algebraic identities remove operations with an unknown operand"
+    (fun () ->
+       let program =
+         lower "int f(int a) { int x = a * 1; int y = x + 0; int z = y - 0; return z / 1; } int main() { return 0; }"
+       in
+       let before = find_func "f" program in
+       let after = Backend.Optimize.optimize_func before in
+       assert_eq "unoptimized" 7 (Option.get (interpret before [ 7 ]));
+       assert_eq "optimized" 7 (Option.get (interpret after [ 7 ]));
+       let arithmetic =
+         List.length
+           (List.filter
+              (function IBinOp (_, (Mul | Add | Sub | Div), _, _) -> true | _ -> false)
+              after.body)
+       in
+       if arithmetic <> 0 then
+         failwith
+           (Printf.sprintf "every operation was an identity, %d survived" arithmetic));
+
+  test "multiplying by zero drops the unknown side" (fun () ->
+      let program =
+        lower "int f(int a) { return a * 0; } int main() { return 0; }"
+      in
+      let before = find_func "f" program in
+      let after = Backend.Optimize.optimize_func before in
+      assert_eq "unoptimized" 0 (Option.get (interpret before [ 99 ]));
+      assert_eq "optimized" 0 (Option.get (interpret after [ 99 ]));
+      if List.exists (function IBinOp (_, Mul, _, _) -> true | _ -> false) after.body then
+        failwith "a * 0 still multiplies");
+
+  test "identities do not fire when the operand is not the neutral one"
+    (fun () ->
+       (* guards against a rule matching too eagerly, which would be
+          silent: the code still runs, it just computes something else *)
+       let program =
+         lower "int f(int a) { return a * 2 + 1; } int main() { return 0; }"
+       in
+       let before = find_func "f" program in
+       let after = Backend.Optimize.optimize_func before in
+       assert_eq "unoptimized" 15 (Option.get (interpret before [ 7 ]));
+       assert_eq "optimized" 15 (Option.get (interpret after [ 7 ])));
+
+  test "comparing a value with itself needs no comparison" (fun () ->
+      let program =
+        lower "int f(int a) { int b = a; if (a == b) return 1; return 0; } int main() { return 0; }"
+      in
+      let before = find_func "f" program in
+      let after = Backend.Optimize.optimize_func before in
+      assert_eq "unoptimized" 1 (Option.get (interpret before [ 5 ]));
+      assert_eq "optimized" 1 (Option.get (interpret after [ 5 ])));
+
   Printf.printf "\nAll optimizer tests passed.\n"

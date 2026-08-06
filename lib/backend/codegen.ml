@@ -47,6 +47,9 @@ type emit_ctx = {
   mutable cur_off : int;
   (* constants folded into instruction immediates, so never materialized *)
   imm_temps : (int, int) Hashtbl.t;
+  (* spill slots are addressed from sp, which never moves inside a body *)
+  mutable spill_base : int;
+  mutable leaf : bool;
 }
 
 and temp_loc = Reg of string | Spill of int
@@ -136,15 +139,58 @@ let allocate_registers (func : func_ir) =
       IntSet.iter (fun live -> add_edge def live) live_out.(i)
     ) defs
   ) defs_uses;
-  (* Every parameter is copied to its home in the prologue, including unused
-     parameters. Keep those entry writes from overwriting one another. *)
+  (* Only temps the body actually mentions need a home. Optimization
+     deletes instructions, and a temp whose every mention is gone would
+     otherwise still be colored -- reserving a callee-saved register that
+     the prologue and epilogue then save and restore for nothing. *)
+  let mentioned =
+    Array.fold_left (fun set (defs, uses) ->
+      IntSet.union set (IntSet.union defs uses)
+    ) IntSet.empty defs_uses
+  in
+  (* Every parameter still mentioned is copied to its home in the
+     prologue. Keep those entry writes from overwriting one another. *)
   let param_temps =
-    List.init (List.length func.params) (fun i -> i) |> set_of_list
+    List.init (List.length func.params) (fun i -> i)
+    |> List.filter (fun t -> IntSet.mem t mentioned)
+    |> set_of_list
   in
   add_clique param_temps;
-  let registers = [| "s1"; "s2"; "s3"; "s4"; "s5"; "s6";
-                     "s7"; "s8"; "s9"; "s10"; "s11" |] in
-  let order = List.init func.temp_count (fun i -> i) in
+  (* A call destroys every caller-saved register, so a value that is live
+     across one has to sit in a callee-saved register (or spill). Values
+     that die before any call can use caller-saved registers instead,
+     which cost nothing to save: a leaf function needs no frame at all. *)
+  let across_calls =
+    let set = ref IntSet.empty in
+    Array.iteri (fun i instr ->
+      match instr with
+      (* The result is produced by the call, not carried across it: it
+         arrives in a0 and may stay in a caller-saved register. *)
+      | ICall (d, _, _) -> set := IntSet.union !set (IntSet.remove d live_out.(i))
+      | ICallVoid _ -> set := IntSet.union !set live_out.(i)
+      | _ -> ()
+    ) body;
+    !set
+  in
+  let callee_saved = [| "s1"; "s2"; "s3"; "s4"; "s5"; "s6";
+                        "s7"; "s8"; "s9"; "s10"; "s11" |] in
+  (* t0-t3 stay reserved as codegen scratch. *)
+  let caller_saved = [| "a0"; "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7";
+                        "t4"; "t5"; "t6" |] in
+  let callee_count = Array.length callee_saved in
+  let register_of_color c =
+    if c < callee_count then callee_saved.(c)
+    else caller_saved.(c - callee_count)
+  in
+  let caller_colors =
+    List.init (Array.length caller_saved) (fun i -> callee_count + i)
+  in
+  let callee_colors = List.init callee_count (fun i -> i) in
+  let param_count = List.length func.params in
+  let order =
+    List.init func.temp_count (fun i -> i)
+    |> List.filter (fun t -> IntSet.mem t mentioned)
+  in
   let order = List.sort (fun a b ->
     compare (IntSet.cardinal adjacency.(b)) (IntSet.cardinal adjacency.(a))
   ) order in
@@ -157,12 +203,20 @@ let allocate_registers (func : func_ir) =
       | Some color -> IntSet.add color set
       | None -> set
     ) adjacency.(temp) IntSet.empty in
-    let rec choose color =
-      if color = Array.length registers then None
-      else if IntSet.mem color unavailable then choose (color + 1)
-      else Some color
+    let candidates =
+      if IntSet.mem temp across_calls then callee_colors
+      else
+        (* a parameter that can stay where it arrived needs no entry copy *)
+        let preferred =
+          if temp < param_count && temp < 8 then [ callee_count + temp ] else []
+        in
+        preferred @ caller_colors @ callee_colors
     in
-    match choose 0 with
+    let rec choose = function
+      | [] -> None
+      | c :: rest -> if IntSet.mem c unavailable then choose rest else Some c
+    in
+    match choose candidates with
     | Some color -> colors.(temp) <- Some color
     | None ->
       Hashtbl.add locations temp (Spill !spill_count);
@@ -170,15 +224,25 @@ let allocate_registers (func : func_ir) =
   ) order;
   Array.iteri (fun temp color ->
     match color with
-    | Some index -> Hashtbl.add locations temp (Reg registers.(index))
+    | Some index -> Hashtbl.add locations temp (Reg (register_of_color index))
     | None -> ()
   ) colors;
-  let used_regs = Array.to_list registers |> List.filteri (fun index _ ->
+  (* only callee-saved registers have to be preserved by this function *)
+  let used_regs = Array.to_list callee_saved |> List.filteri (fun index _ ->
     Array.exists (fun color -> color = Some index) colors
   ) in
   locations, used_regs, !spill_count
 
 let immediate_fits n = n >= -2048 && n <= 2047
+
+(* Multiplying by a power of two is a left shift, which costs one cycle
+   against several for mul. The low 32 bits are identical either way, so
+   this holds for negative values too. *)
+let shift_for_multiply n =
+  if n <= 0 then None
+  else
+    let rec bit k = if k >= 31 then None else if 1 lsl k = n then Some k else bit (k + 1) in
+    bit 1
 
 (* Constants small enough to ride along inside an instruction, and read
    only by instructions that have an immediate form. These need no
@@ -216,6 +280,17 @@ let immediate_temps (body : instr list) =
         else if is_const b then [b]
         else if is_const a then [a]
         else []
+      | IBinOp (_, Mul, a, b) ->
+        (* a power-of-two factor becomes the shift amount *)
+        let shiftable t =
+          match Hashtbl.find_opt candidates t with
+          | Some n -> shift_for_multiply n <> None
+          | None -> false
+        in
+        if is_const a && is_const b then []
+        else if shiftable b then [b]
+        else if shiftable a then [a]
+        else []
       | IBinOp (_, Sub, a, b) ->
         if is_const b && not (is_const a) then [b] else []
       | _ -> []
@@ -247,16 +322,52 @@ let allocation_view imm_temps (body : instr list) =
     | IBinOp (d, Add, a, b) when Hashtbl.mem imm_temps b -> Some (IUnaryOp (d, UPlus, a))
     | IBinOp (d, Add, a, b) when Hashtbl.mem imm_temps a -> Some (IUnaryOp (d, UPlus, b))
     | IBinOp (d, Sub, a, b) when Hashtbl.mem imm_temps b -> Some (IUnaryOp (d, UPlus, a))
+    | IBinOp (d, Mul, a, b) when Hashtbl.mem imm_temps b -> Some (IUnaryOp (d, UPlus, a))
+    | IBinOp (d, Mul, a, b) when Hashtbl.mem imm_temps a -> Some (IUnaryOp (d, UPlus, b))
     | _ -> Some instr
   ) body
 
+(* Words of outgoing arguments the widest call in this function needs.
+   Reserving that area up front is what lets sp stay put for the whole
+   body, which in turn is what makes sp-relative spill slots work and
+   removes the need for a frame pointer. *)
+let outgoing_words (body : instr list) =
+  List.fold_left (fun acc instr ->
+    match instr with
+    | ICall (_, _, args) | ICallVoid (_, args) ->
+      max acc (max 0 (List.length args - 8))
+    | _ -> acc
+  ) 0 body
+
+let is_leaf (body : instr list) =
+  not (List.exists (function ICall _ | ICallVoid _ -> true | _ -> false) body)
+
+type frame = {
+  size : int;
+  locs : (int, temp_loc) Hashtbl.t;
+  saved : string list;
+  immediates : (int, int) Hashtbl.t;
+  leaf : bool;
+  (* byte offset from sp of spill slot 0 *)
+  spill_base : int;
+}
+
 let compute_frame (func : func_ir) =
-  let imm_temps = immediate_temps func.body in
-  let alloc_func = { func with body = allocation_view imm_temps func.body } in
-  let temp_loc, used_regs, spill_count = allocate_registers alloc_func in
-  let saved_slots = 2 + List.length used_regs in
-  let frame_size = align16 ((saved_slots + spill_count) * 4) in
-  (frame_size, temp_loc, used_regs, imm_temps)
+  let immediates = immediate_temps func.body in
+  let alloc_func = { func with body = allocation_view immediates func.body } in
+  let locs, saved, spill_count = allocate_registers alloc_func in
+  let leaf = is_leaf func.body in
+  (* a leaf calls nothing, so it neither passes arguments on the stack
+     nor has a return address worth preserving *)
+  let outgoing = if leaf then 0 else outgoing_words func.body in
+  let ra_words = if leaf then 0 else 1 in
+  let words = outgoing + spill_count + List.length saved + ra_words in
+  { size = align16 (words * 4);
+    locs;
+    saved;
+    immediates;
+    leaf;
+    spill_base = outgoing * 4 }
 
 let emit_addi ctx rd rs imm =
   if imm >= -2048 && imm <= 2047 then
@@ -284,15 +395,17 @@ let emit_sw ctx reg base offset =
     buf_emit ctx "  sw %s, 0(t3)\n" reg
   end
 
+let spill_offset (ctx : emit_ctx) slot = ctx.spill_base + (slot * 4)
+
 let load_temp ctx reg t =
   match Hashtbl.find ctx.temp_loc t with
   | Reg src -> if src <> reg then buf_emit ctx "  mv %s, %s\n" reg src
-  | Spill slot -> emit_lw ctx reg "s0" ((slot * 4) - ctx.frame_size)
+  | Spill slot -> emit_lw ctx reg "sp" (spill_offset ctx slot)
 
 let store_temp ctx reg t =
   match Hashtbl.find ctx.temp_loc t with
   | Reg dst -> if dst <> reg then buf_emit ctx "  mv %s, %s\n" dst reg
-  | Spill slot -> emit_sw ctx reg "s0" ((slot * 4) - ctx.frame_size)
+  | Spill slot -> emit_sw ctx reg "sp" (spill_offset ctx slot)
 
 (* Register already holding temp [t]. A register-allocated temp is read in
    place; only a spilled one costs a load into [scratch]. Operating on the
@@ -302,7 +415,7 @@ let src_reg ctx t scratch =
   match Hashtbl.find ctx.temp_loc t with
   | Reg r -> r
   | Spill slot ->
-    emit_lw ctx scratch "s0" ((slot * 4) - ctx.frame_size);
+    emit_lw ctx scratch "sp" (spill_offset ctx slot);
     scratch
 
 (* Register to compute temp [t] into, plus the store-back that a spilled
@@ -311,27 +424,32 @@ let dst_reg ctx t scratch =
   match Hashtbl.find ctx.temp_loc t with
   | Reg r -> (r, fun () -> ())
   | Spill slot ->
-    (scratch, fun () -> emit_sw ctx scratch "s0" ((slot * 4) - ctx.frame_size))
+    (scratch, fun () -> emit_sw ctx scratch "sp" (spill_offset ctx slot))
 
 let emit_global_addr ctx reg name =
   buf_emit ctx "  la %s, %s\n" reg name
 
-let emit_prologue ctx =
-  emit_addi ctx "sp" "sp" (- ctx.frame_size);
-  emit_sw ctx "ra" "sp" (ctx.frame_size - 4);
-  emit_sw ctx "s0" "sp" (ctx.frame_size - 8);
-  List.iteri (fun i reg ->
-    emit_sw ctx reg "sp" (ctx.frame_size - 12 - (i * 4))
-  ) ctx.used_regs;
-  emit_addi ctx "s0" "sp" ctx.frame_size
+(* Saved registers sit at the top of the frame, under the return address
+   when there is one. Everything is sp-relative: reserving the outgoing
+   argument area up front keeps sp fixed for the whole body, so no frame
+   pointer is needed and s0 is never touched. *)
+let saved_offset (ctx : emit_ctx) i =
+  let ra_words = if ctx.leaf then 0 else 1 in
+  ctx.frame_size - (4 * (ra_words + i + 1))
 
-let emit_epilogue ctx =
-  List.iteri (fun i reg ->
-    emit_lw ctx reg "sp" (ctx.frame_size - 12 - (i * 4))
-  ) ctx.used_regs;
-  emit_lw ctx "ra" "sp" (ctx.frame_size - 4);
-  emit_lw ctx "s0" "sp" (ctx.frame_size - 8);
-  emit_addi ctx "sp" "sp" ctx.frame_size;
+let emit_prologue (ctx : emit_ctx) =
+  if ctx.frame_size > 0 then begin
+    emit_addi ctx "sp" "sp" (- ctx.frame_size);
+    if not ctx.leaf then emit_sw ctx "ra" "sp" (ctx.frame_size - 4);
+    List.iteri (fun i reg -> emit_sw ctx reg "sp" (saved_offset ctx i)) ctx.used_regs
+  end
+
+let emit_epilogue (ctx : emit_ctx) =
+  if ctx.frame_size > 0 then begin
+    List.iteri (fun i reg -> emit_lw ctx reg "sp" (saved_offset ctx i)) ctx.used_regs;
+    if not ctx.leaf then emit_lw ctx "ra" "sp" (ctx.frame_size - 4);
+    emit_addi ctx "sp" "sp" ctx.frame_size
+  end;
   buf_emit ctx "  ret\n"
 
 let emit_binop ctx dst op lhs rhs =
@@ -408,27 +526,63 @@ let emit_fused_branch ctx op lhs rhs lbl ~invert =
   in
   buf_emit ctx "  %s %s, %s, %s\n" mnemonic x y lbl
 
+let arg_regs = [| "a0"; "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7" |]
+
+(* Emit moves that logically happen at once. Now that values can live in
+   the argument registers, a destination may still be another move's
+   source, so the moves are ordered rather than emitted as written; a
+   cycle among them is broken by parking one value in scratch. *)
+let emit_parallel_moves ctx moves =
+  let pending = ref (List.filter (fun (dst, src) -> dst <> src) moves) in
+  let scratch = "t0" in
+  let progressing = ref true in
+  while !progressing && !pending <> [] do
+    let ready =
+      List.find_opt
+        (fun (dst, _) -> not (List.exists (fun (_, src) -> src = dst) !pending))
+        !pending
+    in
+    match ready with
+    | Some (dst, src) ->
+      buf_emit ctx "  mv %s, %s\n" dst src;
+      pending := List.filter (fun (d, _) -> d <> dst) !pending
+    | None ->
+      (* every destination is still someone's source: park one value so
+         its register becomes free to overwrite *)
+      (match !pending with
+       | (dst, _) :: _ ->
+         buf_emit ctx "  mv %s, %s\n" scratch dst;
+         pending :=
+           List.map
+             (fun (d, s) -> if s = dst then (d, scratch) else (d, s))
+             !pending
+       | [] -> progressing := false)
+  done
+
 let emit_call ctx dst_opt name args =
-  let nargs = List.length args in
-  let arg_regs = [| "a0"; "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7" |] in
-  let stack_args = if nargs > 8 then nargs - 8 else 0 in
-  if stack_args > 0 then begin
-    let extra = align16 (stack_args * 4) in
-    emit_addi ctx "sp" "sp" (- extra)
-  end;
+  (* The outgoing area was reserved in the prologue, so sp stays put and
+     spill slots keep their offsets while arguments are set up. *)
+  let reg_moves = ref [] and from_spill = ref [] and onto_stack = ref [] in
   List.iteri (fun i t ->
-    if i < 8 then begin
-      load_temp ctx arg_regs.(i) t
-    end else begin
-      load_temp ctx "t0" t;
-      emit_sw ctx "t0" "sp" ((i - 8) * 4)
-    end
+    if i >= 8 then onto_stack := (i, t) :: !onto_stack
+    else
+      match Hashtbl.find ctx.temp_loc t with
+      | Reg r -> reg_moves := (arg_regs.(i), r) :: !reg_moves
+      | Spill slot -> from_spill := (arg_regs.(i), slot) :: !from_spill
   ) args;
+  (* Stack arguments read their sources first, while no argument register
+     has been overwritten yet. *)
+  List.iter (fun (i, t) ->
+    load_temp ctx "t0" t;
+    emit_sw ctx "t0" "sp" ((i - 8) * 4)
+  ) (List.rev !onto_stack);
+  emit_parallel_moves ctx (List.rev !reg_moves);
+  (* Reloads only write argument registers, so they cannot disturb moves
+     that have already been emitted. *)
+  List.iter (fun (r, slot) ->
+    emit_lw ctx r "sp" (spill_offset ctx slot)
+  ) (List.rev !from_spill);
   buf_emit ctx "  call %s\n" name;
-  if stack_args > 0 then begin
-    let extra = align16 (stack_args * 4) in
-    emit_addi ctx "sp" "sp" extra
-  end;
   (match dst_opt with
    | Some dst -> store_temp ctx "a0" dst
    | None -> ())
@@ -506,6 +660,15 @@ let emit_addi_temp ctx dst src n =
   buf_emit ctx "  addi %s, %s, %d\n" d s n;
   finish ()
 
+(* dst = src * 2^k, emitted as the shift *)
+let emit_shift_temp ctx dst src n =
+  let s = src_reg ctx src "t0" in
+  let d, finish = dst_reg ctx dst "t2" in
+  (match shift_for_multiply n with
+   | Some k -> buf_emit ctx "  slli %s, %s, %d\n" d s k
+   | None -> invalid_arg "emit_shift_temp: factor is not a power of two");
+  finish ()
+
 let emit_instr ctx instr =
   match instr with
   (* a constant that every reader folds in is never materialized *)
@@ -516,6 +679,10 @@ let emit_instr ctx instr =
     emit_addi_temp ctx dst b (Hashtbl.find ctx.imm_temps a)
   | IBinOp (dst, Sub, a, b) when Hashtbl.mem ctx.imm_temps b ->
     emit_addi_temp ctx dst a (- (Hashtbl.find ctx.imm_temps b))
+  | IBinOp (dst, Mul, a, b) when Hashtbl.mem ctx.imm_temps b ->
+    emit_shift_temp ctx dst a (Hashtbl.find ctx.imm_temps b)
+  | IBinOp (dst, Mul, a, b) when Hashtbl.mem ctx.imm_temps a ->
+    emit_shift_temp ctx dst b (Hashtbl.find ctx.imm_temps a)
   | ILoad (dst, Imm n) ->
     let d, finish = dst_reg ctx dst "t0" in
     buf_emit ctx "  li %s, %d\n" d n;
@@ -561,27 +728,51 @@ let is_comparison = function
   | Add | Sub | Mul | Div | Mod | And | Or -> false
 
 let emit_func ctx func =
-  let (frame_size, temp_loc, used_regs, imm_temps) = compute_frame func in
+  let frame = compute_frame func in
   let body = Array.of_list func.body in
-  let offsets = instr_offsets (List.length used_regs) body in
+  let offsets = instr_offsets (List.length frame.saved) body in
   let label_off = label_offsets offsets body in
   let ctx =
     { ctx with
-      func; frame_size; temp_loc; used_regs; label_off; cur_off = 0; imm_temps }
+      func;
+      frame_size = frame.size;
+      temp_loc = frame.locs;
+      used_regs = frame.saved;
+      imm_temps = frame.immediates;
+      spill_base = frame.spill_base;
+      leaf = frame.leaf;
+      label_off;
+      cur_off = 0 }
   in
   buf_emit ctx "\n  .text\n";
   buf_emit ctx "  .globl %s\n" func.name;
   buf_emit ctx "%s:\n" func.name;
   emit_prologue ctx;
-  let arg_regs = [| "a0"; "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7" |] in
+  (* Entry copies from the argument registers to wherever each parameter
+     was allocated. An unused parameter has no home and needs no copy;
+     a parameter allocated to the register it arrived in needs none
+     either, which is what the allocator's preference aims for. *)
+  let entry_moves = ref [] and entry_spills = ref [] and from_stack = ref [] in
   List.iteri (fun i _p ->
-    if i < 8 then
-      store_temp ctx arg_regs.(i) i
-    else begin
-      emit_lw ctx "t0" "s0" ((i - 8) * 4);
-      store_temp ctx "t0" i
+    if Hashtbl.mem ctx.temp_loc i then begin
+      if i >= 8 then from_stack := i :: !from_stack
+      else
+        match Hashtbl.find ctx.temp_loc i with
+        | Reg r -> entry_moves := (r, arg_regs.(i)) :: !entry_moves
+        | Spill slot -> entry_spills := (slot, arg_regs.(i)) :: !entry_spills
     end
   ) func.params;
+  (* Stores read argument registers, so they run before any move can
+     overwrite one. *)
+  List.iter (fun (slot, r) ->
+    emit_sw ctx r "sp" (spill_offset ctx slot)
+  ) (List.rev !entry_spills);
+  emit_parallel_moves ctx (List.rev !entry_moves);
+  List.iter (fun i ->
+    (* incoming stack arguments sit just above this frame *)
+    emit_lw ctx "t0" "sp" (ctx.frame_size + ((i - 8) * 4));
+    store_temp ctx "t0" i
+  ) (List.rev !from_stack);
   let uses = use_counts body in
   let count = Array.length body in
   let i = ref 0 in
@@ -645,6 +836,8 @@ let emit (out : out_channel) (prog : program) : unit =
     label_off = Hashtbl.create 0;
     cur_off = 0;
     imm_temps = Hashtbl.create 0;
+    spill_base = 0;
+    leaf = true;
   } in
   emit_globals ctx prog.globals;
   List.iter (emit_func ctx) prog.funcs;

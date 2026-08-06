@@ -207,6 +207,44 @@ let get_const env t =
 
 
 (* =====================================================
+   Algebraic identities
+
+   Cases where one operand alone settles the result, so the
+   operation is replaced by a copy of the other side or by a
+   constant, even though that other side is unknown. Operands are
+   temps and reading one has no side effect, so dropping a side is
+   always safe.
+
+   Division and modulo by zero are left alone: folding them would
+   invent a result for something the target would trap on.
+   ===================================================== *)
+
+let simplify_algebraic (op:A.bin_op) ca cb a b =
+  match op, ca, cb with
+
+  | A.Add, Some 0, _ -> `Copy b
+  | A.Add, _, Some 0 -> `Copy a
+
+  | A.Sub, _, Some 0 -> `Copy a
+  | A.Sub, _, _ when a = b -> `Const 0
+
+  | A.Mul, Some 1, _ -> `Copy b
+  | A.Mul, _, Some 1 -> `Copy a
+  | A.Mul, Some 0, _ -> `Const 0
+  | A.Mul, _, Some 0 -> `Const 0
+
+  | A.Div, _, Some 1 -> `Copy a
+  | A.Mod, _, Some 1 -> `Const 0
+
+  (* a relation between a value and itself needs no comparison *)
+  | (A.Eq | A.Le | A.Ge), _, _ when a = b -> `Const 1
+  | (A.Ne | A.Lt | A.Gt), _, _ when a = b -> `Const 0
+
+  | _ -> `Keep
+
+
+
+(* =====================================================
    Rewrite instruction
    ===================================================== *)
 
@@ -363,7 +401,40 @@ match instr with
 
 
 
-    | _ ->
+    | ca, cb ->
+
+
+        (* algebraic identities: an operand of 1 or 0, or the same temp
+           on both sides, can make the operation disappear even though
+           the other side is unknown *)
+
+        begin match simplify_algebraic op ca cb a b with
+
+
+        | `Const n ->
+
+
+            kill env dst;
+
+            Hashtbl.replace env.const_table dst n;
+
+            ILoad(dst,Imm n)
+
+
+
+        | `Copy src ->
+
+
+            kill env dst;
+
+            if dst <> src then
+              Hashtbl.replace env.copy_table dst src;
+
+            ILoad(dst,Temp src)
+
+
+
+        | `Keep ->
 
 
         (* common subexpression elimination: reuse an earlier
@@ -391,6 +462,8 @@ match instr with
             Hashtbl.replace env.expr_table (bin_key op a b) dst;
 
             IBinOp(dst,op,a,b)
+
+        end
 
         end
 
@@ -911,6 +984,81 @@ let rec schedule_block = function
 
 
 (* =====================================================
+   Loop-invariant constant hoisting
+
+   A loop condition like `i < 100` reloads the 100 on every single
+   iteration, which in a three-instruction loop body is a third of the
+   work. A constant load reads nothing, so it is invariant in any loop
+   containing it and can move to a preheader.
+
+   This runs before rotation, while a loop still starts with its header
+   label reached by fall-through from above -- that makes the slot just
+   before the header a valid preheader. After rotation the loop is
+   entered by a jump over the body, so the same slot would be dead code.
+   ===================================================== *)
+
+let hoist_loop_constants (body : instr list) : instr list =
+  let arr = Array.of_list body in
+  let n = Array.length arr in
+  let label_index = Hashtbl.create 16 in
+  Array.iteri
+    (fun i instr ->
+       match instr with
+       | ILabel l -> Hashtbl.replace label_index l i
+       | _ -> ())
+    arr;
+  let def_count = Hashtbl.create 64 in
+  Array.iter
+    (fun instr ->
+       match instr_def instr with
+       | Some d ->
+         Hashtbl.replace def_count d
+           (1 + Option.value ~default:0 (Hashtbl.find_opt def_count d))
+       | None -> ())
+    arr;
+  (* For each instruction, the header of the outermost loop enclosing it.
+     A transfer to a label at or before it closes a loop over that span. *)
+  let header = Array.make n (-1) in
+  Array.iteri
+    (fun i instr ->
+       let target =
+         match instr with
+         | IJump l | IBranchTrue (_, l) | IBranchFalse (_, l) ->
+           Hashtbl.find_opt label_index l
+         | _ -> None
+       in
+       match target with
+       | Some j when j <= i ->
+         for k = j to i do
+           if header.(k) = -1 || j < header.(k) then header.(k) <- j
+         done
+       | _ -> ())
+    arr;
+  let hoisted = Array.make n [] in
+  let removed = Array.make n false in
+  Array.iteri
+    (fun k instr ->
+       match instr with
+       | ILoad (t, Imm _)
+         when header.(k) >= 0
+              && header.(k) < k
+              && Hashtbl.find_opt def_count t = Some 1 ->
+         let j = header.(k) in
+         hoisted.(j) <- hoisted.(j) @ [ instr ];
+         removed.(k) <- true
+       | _ -> ())
+    arr;
+  let out = ref [] in
+  Array.iteri
+    (fun i instr ->
+       List.iter (fun h -> out := h :: !out) hoisted.(i);
+       if not removed.(i) then out := instr :: !out)
+    arr;
+  List.rev !out
+
+
+
+(* =====================================================
    Loop rotation
 
    `while` lowers to a test at the top and an unconditional jump back
@@ -984,8 +1132,11 @@ let rec rotate_loops instrs =
    ===================================================== *)
 
 let optimize_func f =
-  (* rotation matches the shape lowering produces, so it runs first *)
-  let cfg = Cfg.build (rotate_loops f.body) in
+  (* Folding runs first, while a constant condition still sits in the
+     same block as the branch reading it -- hoisting the constant out to
+     a preheader would put a label between them and lose the value, so a
+     `while (0)` would survive as real code. *)
+  let cfg = Cfg.build f.body in
   let blocks =
     Array.map optimize_block cfg.blocks
   in
@@ -995,8 +1146,11 @@ let optimize_func f =
     |> List.filter (function IComment _ -> false | _ -> true)
   in
   let live = prune_unreachable folded in
+  (* Reshaping the loops that are left. Hoisting needs the pre-rotation
+     shape, where the header is still reached by fall-through. *)
+  let shaped = rotate_loops (hoist_loop_constants live) in
   let body =
-    dead_code_eliminate live
+    dead_code_eliminate shaped
     |> drop_redundant_jumps
     |> schedule_block
   in
