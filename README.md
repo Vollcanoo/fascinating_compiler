@@ -25,11 +25,11 @@ dune build
 ## 使用
 
 ```bash
-# 基本编译
+# 基本编译（优化默认开启）
 dune exec fascinating_compiler < examples/hello.tc > output.s
 
-# 开启优化
-dune exec fascinating_compiler -- -opt < examples/hello.tc > output.s
+# 关闭优化（用于对比调试）
+dune exec fascinating_compiler -- -no-opt < examples/hello.tc > output.s
 ```
 
 ## 编译流水线
