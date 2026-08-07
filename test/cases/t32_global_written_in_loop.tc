@@ -1,0 +1,17 @@
+// EXPECT: 45
+// Here the callee writes the global the loop reads, so the read cannot be
+// hoisted out of the loop.
+int step = 0;
+void advance() {
+  step = step + 1;
+}
+int main() {
+  int i = 0;
+  int s = 0;
+  while (i < 10) {
+    s = s + step;
+    advance();
+    i = i + 1;
+  }
+  return s;
+}

@@ -1,0 +1,14 @@
+// EXPECT: 21
+// Each call has a side effect, so the order operands are evaluated in is
+// observable. Optimizations must not reorder them.
+int c = 0;
+int next() {
+  c = c + 1;
+  return c;
+}
+int main() {
+  int a = next();
+  int b = next();
+  int d = next();
+  return a * 1 + b * 10 + d * 0;
+}

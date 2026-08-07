@@ -1,0 +1,21 @@
+// Mixed branchy integer work with division and remainder by 2.
+int main() {
+  int best = 0;
+  int bestn = 0;
+  int n = 1;
+  while (n < 3000) {
+    int m = n;
+    int steps = 0;
+    while (m != 1) {
+      if (m % 2 == 0) m = m / 2;
+      else m = 3 * m + 1;
+      steps = steps + 1;
+    }
+    if (steps > best) {
+      best = steps;
+      bestn = n;
+    }
+    n = n + 1;
+  }
+  return bestn % 251;
+}

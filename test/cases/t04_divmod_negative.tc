@@ -1,0 +1,12 @@
+// EXPECT: 200
+// C division truncates toward zero and the remainder takes the sign of the
+// dividend. Every term below cancels to zero if that holds.
+int main() {
+  int a = -7;
+  int b = 2;
+  int q = a / b;   // -3
+  int r = a % b;   // -1
+  int c = 7 / -2;  // -3
+  int d = 7 % -2;  //  1
+  return (q + 3) * 100 + (r + 1) * 10 + (c + 3) * 5 + (d - 1) + 200;
+}

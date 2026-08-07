@@ -1,0 +1,15 @@
+(executable
+ (name regress)
+ (modules regress rv32 interp)
+ (libraries ast frontend analysis backend))
+
+; `dune test` runs the functional cases. The benchmarks are not part of the
+; alias because they take a while; run them with
+;   dune exec test/regress/regress.exe -- test/bench
+(rule
+ (alias runtest)
+ (deps
+  regress.exe
+  (source_tree ../cases))
+ (action
+  (run ./regress.exe ../cases)))

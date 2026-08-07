@@ -1,0 +1,14 @@
+// EXPECT: 199
+// Strength reduction must preserve C semantics for negative operands:
+// -13 / 4 is -3 (not -4), and -13 % 4 is -1 (not 3). Each term cancels
+// to zero only if the shift sequence rounds toward zero.
+int main() {
+  int x = -13;
+  int r = 0;
+  r = r + (x * 8) + 104;
+  r = r + (x / 4) + 3;
+  r = r + (x % 4) + 1;
+  r = r + (x / 8) + 1;
+  r = r + (x % 8) + 5;
+  return r + 199;
+}

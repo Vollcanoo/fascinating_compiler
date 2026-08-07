@@ -1,0 +1,9 @@
+// EXPECT: 2
+// The else must bind to the inner if.
+int main() {
+  int r = 0;
+  if (1)
+    if (0) r = 1;
+    else r = 2;
+  return r;
+}

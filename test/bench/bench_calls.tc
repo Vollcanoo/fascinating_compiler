@@ -1,0 +1,14 @@
+// Call overhead in isolation: the callee body is trivial, so almost all of
+// the work is the call sequence itself.
+int add3(int a, int b, int c) {
+  return a + b + c;
+}
+int main() {
+  int i = 0;
+  int s = 0;
+  while (i < 500000) {
+    s = s + add3(i, 1, 2);
+    i = i + 1;
+  }
+  return s % 251;
+}

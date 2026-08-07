@@ -1,0 +1,10 @@
+// EXPECT: 27
+// Logical operators must yield exactly 0 or 1, not just any nonzero value.
+int main() {
+  int r = 0;
+  if (!0) r = r + 1;
+  if (!5 == 0) r = r + 2;
+  if ((3 && 4) == 1) r = r + 8;
+  if ((0 || 7) == 1) r = r + 16;
+  return r;
+}

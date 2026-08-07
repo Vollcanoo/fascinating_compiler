@@ -1,0 +1,10 @@
+// EXPECT: 30
+int f(int x) {
+  return x * 2;
+}
+int g(int x, int y) {
+  return f(x) + f(y);
+}
+int main() {
+  return g(5, 10);
+}

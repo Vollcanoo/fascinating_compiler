@@ -1,0 +1,10 @@
+// EXPECT: 7
+int acc = 0;
+void add(int v) {
+  acc = acc + v;
+}
+int main() {
+  add(3);
+  add(4);
+  return acc;
+}

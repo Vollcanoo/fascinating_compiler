@@ -1,15 +1,19 @@
 (test
  (name test_lexer)
+ (modules test_lexer)
  (libraries frontend))
 
 (test
  (name test_parser)
+ (modules test_parser)
  (libraries ast frontend))
 
 (test
  (name test_semantic)
+ (modules test_semantic)
  (libraries ast frontend analysis backend))
 
 (test
  (name test_codegen)
+ (modules test_codegen)
  (libraries ast frontend analysis backend))

@@ -1,0 +1,14 @@
+// EXPECT: 100
+// a * b is loop invariant but reads globals, so hoisting it is only legal
+// while nothing in the loop can write them.
+int a = 3;
+int b = 4;
+int main() {
+  int i = 0;
+  int s = 0;
+  while (i < 100) {
+    s = s + (a * b - 12) + 1;
+    i = i + 1;
+  }
+  return s;
+}

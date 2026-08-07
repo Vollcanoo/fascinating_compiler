@@ -1,0 +1,12 @@
+// EXPECT: 7
+int find() {
+  int i = 0;
+  while (i < 100) {
+    if (i * i > 40) return i;
+    i = i + 1;
+  }
+  return -1;
+}
+int main() {
+  return find();
+}

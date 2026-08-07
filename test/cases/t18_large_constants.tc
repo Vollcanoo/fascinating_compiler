@@ -1,0 +1,8 @@
+// EXPECT: 57
+// Immediates well outside the 12-bit addi range.
+int main() {
+  int a = 1000000;
+  int b = 999999;
+  int c = -1000000;
+  return (a - b) * 57 + (c + 1000000);
+}

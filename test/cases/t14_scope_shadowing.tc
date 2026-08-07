@@ -1,0 +1,17 @@
+// EXPECT: 12
+// The local x shadows the global; each inner block shadows again.
+int x = 1;
+int main() {
+  int x = 2;
+  int r = x;
+  {
+    int x = 3;
+    r = r + x;
+  }
+  {
+    const int x = 4;
+    r = r + x;
+  }
+  r = r + 3;
+  return r;
+}

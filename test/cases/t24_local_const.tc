@@ -1,0 +1,7 @@
+// EXPECT: 30
+int main() {
+  const int A = 5;
+  const int B = A * 2 + 4;
+  int c = A + B + 11;
+  return c;
+}

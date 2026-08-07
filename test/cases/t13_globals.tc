@@ -1,0 +1,7 @@
+// EXPECT: 30
+int g = 10;
+const int K = 20;
+int main() {
+  g = g + K;
+  return g;
+}

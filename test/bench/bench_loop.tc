@@ -1,0 +1,11 @@
+// Tight counted loop: measures per-iteration overhead (compare, branch, and
+// the induction variable update).
+int main() {
+  int i = 0;
+  int s = 0;
+  while (i < 2000000) {
+    s = s + i % 7;
+    i = i + 1;
+  }
+  return s % 251;
+}

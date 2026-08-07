@@ -1,0 +1,13 @@
+// EXPECT: 1
+// bump() must never run: || short-circuits on a true left operand.
+int hits = 0;
+int bump() {
+  hits = hits + 1;
+  return 1;
+}
+int main() {
+  if (1 || bump()) {
+    hits = hits + 0;
+  }
+  return hits + 1;
+}
