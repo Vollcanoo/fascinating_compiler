@@ -1,0 +1,36 @@
+// EXPECT: 177
+// A frame may only be skipped on a path that provably never built one.
+int helper(int x) {
+  return x * 3;
+}
+
+// Cheap answer before any call: that path should need no frame at all.
+int guard(int n) {
+  if (n < 0) return -n;
+  return helper(n) + 1;
+}
+
+// The return is reachable from the call but not dominated by it, so it would
+// sometimes need an epilogue and sometimes not. The frame has to be built
+// eagerly here.
+int merge(int n) {
+  int r = 7;
+  if (n > 0) r = helper(n);
+  return r;
+}
+
+// Early exit out of a void function, where there is no value to carry back.
+void nothing(int n) {
+  if (n == 0) return;
+  return;
+}
+
+// Arguments come from a global so that -opt cannot fold the calls away and
+// stops exercising the frames.
+int seed = 4;
+
+int main() {
+  nothing(0);
+  nothing(seed);
+  return guard(0 - seed - 1) + guard(seed) + merge(0) + merge(seed - 1) + 143;
+}

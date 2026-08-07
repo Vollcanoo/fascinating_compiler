@@ -1171,6 +1171,104 @@ let materialize_loop_constants body =
   fix body
 
 (* =====================================================
+   Splitting a parameter's live range
+
+   Consider a function that answers a cheap case up front and only then does
+   real work:
+
+     int fib(int n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }
+
+   [n] is read on the early-exit path and again after two calls, so its live
+   range crosses a call and the allocator has to give it a callee-saved
+   register.  That decision reaches backwards: the incoming argument must be
+   copied into that register at entry, and the register has to be saved and
+   restored, all of which the early exit pays for and none of which it needs.
+
+   Copying [n] once at the head of the region that contains the calls splits
+   the range in two.  The entry half never crosses a call, so it can stay in
+   the argument register it arrived in, and the early exit becomes free.  The
+   copy is not new work: it replaces the entry copy that was there before, and
+   only runs on the path that was going to pay for it anyway.
+
+   This runs last, after the main fixpoint, because copy propagation would
+   otherwise fold the split straight back together.
+   ===================================================== *)
+
+let split_once body =
+  let cfg = Cfg.build body in
+  let count = Array.length cfg.instrs in
+  let doms = Cfg.dominators cfg in
+  let liveness = Liveness.analyze cfg in
+  let depths = Cfg.loop_depths cfg in
+  let counts = definition_counts body in
+  let indices = List.init count (fun i -> i) in
+  let param_temps =
+    Array.to_list cfg.instrs
+    |> List.filter_map (function ILoadParam (t, _) -> Some t | _ -> None)
+  in
+  let definition_index t =
+    List.find_opt (fun i -> instr_dest cfg.instrs.(i) = Some t) indices
+  in
+  let crosses_call_at i t =
+    match cfg.instrs.(i) with
+    | ICall _ ->
+      IntSet.mem t liveness.Liveness.live_out.(i) && not (IntSet.mem t cfg.defs.(i))
+    | _ -> false
+  in
+  let try_label j =
+    (* A split point has to run at most once per call, so never inside a loop. *)
+    if depths.(j) > 0 then None
+    else
+      match cfg.instrs.(j) with
+      | ILabel _ ->
+        let in_region = Array.init count (fun i -> Cfg.dominates doms j i) in
+        let worth_splitting t =
+          IntMap.find_opt t counts = Some 1
+          && (match definition_index t with
+              | Some d -> not in_region.(d)
+              | None -> false)
+          && IntSet.mem t liveness.Liveness.live_in.(j)
+          && List.exists (fun i -> in_region.(i) && crosses_call_at i t) indices
+          (* Splitting only pays if the remaining range is call-free. *)
+          && not (List.exists (fun i -> (not in_region.(i)) && crosses_call_at i t) indices)
+        in
+        (match List.filter worth_splitting param_temps with
+         | [] -> None
+         | temps -> Some (j, in_region, temps))
+      | _ -> None
+  in
+  match List.find_map try_label indices with
+  | None -> body
+  | Some (j, in_region, temps) ->
+    let next_temp = ref (max_temp body + 1) in
+    let renaming =
+      List.map (fun t ->
+        let fresh = !next_temp in
+        incr next_temp;
+        (t, fresh)
+      ) temps
+    in
+    let copies = List.map (fun (t, fresh) -> ILoad (fresh, Temp t)) renaming in
+    let rename = function
+      | Temp t as operand ->
+        (match List.assoc_opt t renaming with Some fresh -> Temp fresh | None -> operand)
+      | operand -> operand
+    in
+    body
+    |> List.mapi (fun i instr ->
+      if i = j then instr :: copies
+      else if in_region.(i) then [map_operands rename instr]
+      else [instr])
+    |> List.concat
+
+let split_param_live_ranges body =
+  let rec fix body =
+    let next = split_once body in
+    if next = body then body else fix next
+  in
+  fix body
+
+(* =====================================================
    Entry point
    ===================================================== *)
 
@@ -1191,6 +1289,7 @@ let run (program : program) : program =
         |> licm
         |> eliminate_dead_defs
         |> cleanup_control_flow
+        |> split_param_live_ranges
       in
       { func with body; temp_count = max_temp body + 1 })
   in

@@ -360,7 +360,97 @@ let emit_epilogue ctx =
    Instruction dispatch
    ===================================================== *)
 
-let emit_instr ctx = function
+(* =====================================================
+   Shrink wrapping
+
+   A function that answers a cheap case before doing any real work should not
+   pay for a stack frame on that path.  The prologue is placed at the deepest
+   instruction that dominates everything needing the frame — a call, a spill
+   slot access, or a write to a callee-saved register — and returns that the
+   placement point cannot reach return without an epilogue, because nothing has
+   been pushed yet.
+
+   The placement point must run at most once per call, so it may not sit inside
+   a loop, and every return it can reach must be dominated by it, otherwise a
+   return would sometimes need the epilogue and sometimes not.
+   ===================================================== *)
+
+let frame_needed_at ctx instr =
+  let spilled t =
+    match Regalloc.location ctx.alloc t with Regalloc.Spill _ -> true | _ -> false
+  in
+  let callee_saved t =
+    match Regalloc.location ctx.alloc t with
+    | Regalloc.Reg reg -> List.mem reg ctx.alloc.Regalloc.used_regs
+    | Regalloc.Spill _ -> false
+  in
+  match instr with
+  | ICall _ -> true
+  | instr ->
+    let dest_needs =
+      match instr_dest instr with
+      | Some d -> spilled d || callee_saved d
+      | None -> false
+    in
+    dest_needs
+    || List.exists
+         (fun operand ->
+           match operand_temp operand with Some t -> spilled t | None -> false)
+         (instr_operands instr)
+
+let shrink_wrap_point ctx (func : func_ir) =
+  (* Arguments past the eighth are read relative to sp, at an offset that
+     depends on whether the frame is already up. Not worth the special case. *)
+  if List.length func.params > 8 then None
+  else
+    let cfg = Cfg.build func.body in
+    let count = Array.length cfg.instrs in
+    let indices = List.init count (fun i -> i) in
+    match List.filter (fun i -> frame_needed_at ctx cfg.instrs.(i)) indices with
+    | [] -> None
+    | first :: rest ->
+      let doms = Cfg.dominators cfg in
+      let required = first :: rest in
+      let common =
+        List.fold_left (fun acc i -> Cfg.IntSet.inter acc doms.(i)) doms.(first) rest
+      in
+      let deepest =
+        Cfg.IntSet.fold (fun i best ->
+          match best with
+          | Some b when Cfg.IntSet.cardinal doms.(b) >= Cfg.IntSet.cardinal doms.(i) ->
+            best
+          | _ -> Some i
+        ) common None
+      in
+      (match deepest with
+       | None | Some 0 -> None
+       | Some point ->
+         let depths = Cfg.loop_depths cfg in
+         let reached = Array.make count false in
+         let rec visit = function
+           | [] -> ()
+           | i :: rest ->
+             if i < 0 || i >= count || reached.(i) then visit rest
+             else begin
+               reached.(i) <- true;
+               visit (cfg.succs.(i) @ rest)
+             end
+         in
+         visit [point];
+         let returns_are_consistent =
+           indices
+           |> List.for_all (fun i ->
+             match cfg.instrs.(i) with
+             | IReturn _ -> (not reached.(i)) || Cfg.dominates doms point i
+             | _ -> true)
+         in
+         if depths.(point) > 0
+            || not returns_are_consistent
+            || not (List.for_all (fun i -> point <= i) required)
+         then None
+         else Some (point, Array.init count (fun i -> Cfg.dominates doms point i)))
+
+let emit_instr ctx ~framed = function
   | ILoadParam (dst, index) ->
     if index < 8 then store_result ctx arg_regs.(index) dst
     else
@@ -390,7 +480,8 @@ let emit_instr ctx = function
   | IBranchNonZero (operand, label) -> emit_branch ctx operand label ~when_zero:false
   | IReturn operand ->
     let load = match operand with None -> [] | Some o -> load_into ctx "a0" o in
-    load @ emit_epilogue ctx
+    (* Nothing has been pushed on a path the prologue never reached. *)
+    load @ (if framed then emit_epilogue ctx else line "  ret")
 
 let is_comparison = function Lt | Gt | Le | Ge | Eq | Ne -> true | _ -> false
 
@@ -403,24 +494,53 @@ let rec temp_used_later t = function
 
 (* IR-level peephole: fuse a comparison into the branch that consumes it, and
    let a call whose result is returned unchanged leave its value in a0. *)
-let emit_body ctx body =
-  let rec loop acc = function
+let emit_body ctx ~wrap body =
+  let prologue_at, framed =
+    match wrap with
+    | None -> (0, fun _ -> true)
+    | Some (point, dominated) -> (point, fun index -> dominated.(index))
+  in
+  let emitted = ref false in
+  (* The prologue goes in front of the first group whose index reaches the
+     placement point, which may be either half of a fused pair. *)
+  let prologue index =
+    if (not !emitted) && index >= prologue_at then begin
+      emitted := true;
+      emit_prologue ctx
+    end
+    else []
+  in
+  let rec loop index acc = function
     | IBinOp (dst, op, lhs, rhs) :: IBranchZero (Temp t, label) :: rest
       when dst = t && is_comparison op && not (temp_used_later t rest) ->
       let inverse = Option.get (inverse_comparison op) in
-      loop (List.rev_append (emit_branch_compare ctx inverse lhs rhs label) acc) rest
+      loop (index + 2)
+        (List.rev_append
+           (prologue index @ emit_branch_compare ctx inverse lhs rhs label) acc)
+        rest
     | IBinOp (dst, op, lhs, rhs) :: IBranchNonZero (Temp t, label) :: rest
       when dst = t && is_comparison op && not (temp_used_later t rest) ->
-      loop (List.rev_append (emit_branch_compare ctx op lhs rhs label) acc) rest
+      loop (index + 2)
+        (List.rev_append
+           (prologue index @ emit_branch_compare ctx op lhs rhs label) acc)
+        rest
     | ICall (Some dst, name, args) :: IReturn (Some (Temp result)) :: rest
       when dst = result && not (temp_used_later dst rest) ->
-      loop
-        (List.rev_append (emit_call ctx None name args @ emit_epilogue ctx) acc)
+      let epilogue =
+        if framed (index + 1) then emit_epilogue ctx else line "  ret"
+      in
+      loop (index + 2)
+        (List.rev_append
+           (prologue index @ emit_call ctx None name args @ epilogue) acc)
         rest
-    | instr :: rest -> loop (List.rev_append (emit_instr ctx instr) acc) rest
+    | instr :: rest ->
+      loop (index + 1)
+        (List.rev_append
+           (prologue index @ emit_instr ctx ~framed:(framed index) instr) acc)
+        rest
     | [] -> List.rev acc
   in
-  loop [] body
+  loop 0 [] body
 
 (* =====================================================
    Assembly-level peephole
@@ -491,10 +611,11 @@ let emit_func (func : func_ir) =
          + (4 * alloc.Regalloc.spill_slots))
   in
   let ctx = { alloc; frame_size; use_frame; use_frame_pointer } in
+  let wrap = if use_frame then shrink_wrap_point ctx func else None in
   line "  .text"
   @ line "  .globl %s" func.name
   @ line "%s:" func.name
-  @ peephole (emit_prologue ctx @ emit_body ctx func.body)
+  @ peephole (emit_body ctx ~wrap func.body)
 
 let emit_globals globals =
   if globals = [] then []
