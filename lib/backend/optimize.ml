@@ -953,11 +953,14 @@ let has_backedge body =
   let doms = Cfg.dominators cfg in
   Cfg.back_edges cfg doms <> []
 
+(* A callee containing a loop is still worth inlining when it is small: the call
+   sequence disappears and, more importantly, constant arguments reach into the
+   loop body.  The budget is tighter than for straight-line code because the
+   body gets duplicated at every call site. *)
 let inline_candidate (func : func_ir) =
   func.name <> "main"
-  && inline_cost func.body <= 40
   && not (has_call func.body)
-  && not (has_backedge func.body)
+  && inline_cost func.body <= (if has_backedge func.body then 20 else 40)
 
 let inline_call next_temp fresh_label (callee : func_ir) dst args =
   let fresh () =
