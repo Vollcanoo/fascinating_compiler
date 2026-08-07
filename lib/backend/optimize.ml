@@ -122,6 +122,58 @@ let simplify_shift dst operand amount =
   | Temp _ when amount = 0 -> move_or_nop dst operand
   | Temp _ -> [IShiftLeft (dst, operand, amount)]
 
+let simplify_bit_and dst operand mask =
+  match operand with
+  | Imm value -> [ILoad (dst, Imm (value land mask))]
+  | Temp _ -> [IBitAnd (dst, operand, mask)]
+
+(* =====================================================
+   Remainders that are only tested against zero
+
+   "x % 2^k" needs a sign correction because C rounds towards zero, which costs
+   six instructions.  But "x % 2^k == 0" holds exactly when the low k bits of x
+   are clear, whatever the sign, so a single mask answers the question.  This
+   only fires when *every* use of the remainder is a zero test.
+   ===================================================== *)
+
+let power_of_two_mask = function
+  | Imm value when value <> min_i32 ->
+    let magnitude = abs value in
+    if Target.is_power_of_two magnitude then Some (magnitude - 1) else None
+  | _ -> None
+
+let only_tested_against_zero body t =
+  let uses_t instr = List.exists (fun operand -> operand = Temp t) (instr_operands instr) in
+  List.for_all (fun instr ->
+    match instr with
+    | IBinOp (_, (A.Eq | A.Ne), Temp u, Imm 0)
+    | IBinOp (_, (A.Eq | A.Ne), Imm 0, Temp u)
+    | IBranchZero (Temp u, _)
+    | IBranchNonZero (Temp u, _) when u = t -> true
+    | instr -> not (uses_t instr)
+  ) body
+
+let definition_counts body =
+  List.fold_left (fun counts instr ->
+    match instr_dest instr with
+    | None -> counts
+    | Some dst ->
+      IntMap.add dst ((IntMap.find_opt dst counts |> Option.value ~default:0) + 1) counts
+  ) IntMap.empty body
+
+let rewrite_modulo_zero_tests body =
+  let counts = definition_counts body in
+  List.map (fun instr ->
+    match instr with
+    | IBinOp (dst, A.Mod, lhs, rhs) ->
+      (match power_of_two_mask rhs with
+       | Some mask
+         when IntMap.find_opt dst counts = Some 1 && only_tested_against_zero body dst ->
+         IBitAnd (dst, lhs, mask)
+       | _ -> instr)
+    | instr -> instr
+  ) body
+
 (* =====================================================
    Local pass: constant/copy propagation and local CSE
    ===================================================== *)
@@ -134,6 +186,7 @@ type expr_key =
   | EUnary of A.unary_op * operand
   | EBinary of A.bin_op * operand * operand
   | EShift of operand * int
+  | EBitAnd of operand * int
 
 module ExprMap = Map.Make (struct
   type t = expr_key
@@ -175,6 +228,7 @@ let expr_of_instr = function
     let lhs, rhs = canonical_binop op lhs rhs in
     Some (EBinary (op, lhs, rhs))
   | IShiftLeft (_, operand, amount) -> Some (EShift (operand, amount))
+  | IBitAnd (_, operand, mask) -> Some (EBitAnd (operand, mask))
   | _ -> None
 
 let expr_of_instrs = function
@@ -182,7 +236,7 @@ let expr_of_instrs = function
   | _ -> None
 
 let expr_temps = function
-  | EUnary (_, operand) | EShift (operand, _) ->
+  | EUnary (_, operand) | EShift (operand, _) | EBitAnd (operand, _) ->
     (match operand_temp operand with Some t -> IntSet.singleton t | None -> IntSet.empty)
   | EBinary (_, lhs, rhs) ->
     List.filter_map operand_temp [lhs; rhs]
@@ -259,6 +313,9 @@ let local_pass body =
        | IShiftLeft (dst, operand, amount) ->
          let operand = rewrite_operand env operand in
          keep_defining dst (apply_cse dst (simplify_shift dst operand amount) exprs)
+       | IBitAnd (dst, operand, mask) ->
+         let operand = rewrite_operand env operand in
+         keep_defining dst (apply_cse dst (simplify_bit_and dst operand mask) exprs)
        | IStoreGlobal (name, operand) ->
          let operand = rewrite_operand env operand in
          loop env exprs true (IStoreGlobal (name, operand) :: acc) rest
@@ -436,6 +493,11 @@ let transfer_const env instr =
       (match lattice_of env operand with
        | LConst value -> LConst (apply_shift_left value amount)
        | other -> other)
+  | IBitAnd (dst, operand, mask) ->
+    define dst
+      (match lattice_of env operand with
+       | LConst value -> LConst (value land mask)
+       | other -> other)
   | ICall (Some dst, _, _) -> define dst LOverdef
   | ICall (None, _, _) | IStoreGlobal _ | ILabel _ | IJump _ | IBranchZero _
   | IBranchNonZero _ | IReturn _ -> env
@@ -516,6 +578,7 @@ let propagate_constants body =
          | None -> Some folded)
       | IShiftLeft (dst, Imm value, amount) ->
         Some (ILoad (dst, Imm (apply_shift_left value amount)))
+      | IBitAnd (dst, Imm value, mask) -> Some (ILoad (dst, Imm (value land mask)))
       | IBranchZero (Imm 0, label) -> Some (IJump label)
       | IBranchZero (Imm _, _) -> None
       | IBranchNonZero (Imm 0, _) -> None
@@ -598,12 +661,13 @@ let retarget_dest dst = function
   | IUnaryOp (_, op, operand) -> IUnaryOp (dst, op, operand)
   | IBinOp (_, op, lhs, rhs) -> IBinOp (dst, op, lhs, rhs)
   | IShiftLeft (_, operand, amount) -> IShiftLeft (dst, operand, amount)
+  | IBitAnd (_, operand, mask) -> IBitAnd (dst, operand, mask)
   | ILoadGlobal (_, name) -> ILoadGlobal (dst, name)
   | ICall (Some _, name, args) -> ICall (Some dst, name, args)
   | instr -> instr
 
 let retargetable = function
-  | ILoad _ | IUnaryOp _ | IBinOp _ | IShiftLeft _ | ILoadGlobal _
+  | ILoad _ | IUnaryOp _ | IBinOp _ | IShiftLeft _ | IBitAnd _ | ILoadGlobal _
   | ICall (Some _, _, _) -> true
   | _ -> false
 
@@ -633,17 +697,9 @@ let fold_assignment_temps body =
 (* Division on RISC-V never traps, so every pure computation below is safe to
    speculate into the preheader. *)
 let hoistable = function
-  | ILoad _ | IUnaryOp _ | IBinOp _ | IShiftLeft _ -> true
+  | ILoad _ | IUnaryOp _ | IBinOp _ | IShiftLeft _ | IBitAnd _ -> true
   | ILoadParam _ | ILoadGlobal _ | IStoreGlobal _ | ICall _ | ILabel _
   | IJump _ | IBranchZero _ | IBranchNonZero _ | IReturn _ -> false
-
-let definition_counts body =
-  List.fold_left (fun counts instr ->
-    match instr_dest instr with
-    | None -> counts
-    | Some dst ->
-      IntMap.add dst ((IntMap.find_opt dst counts |> Option.value ~default:0) + 1) counts
-  ) IntMap.empty body
 
 let licm_once body =
   let cfg = Cfg.build body in
@@ -734,6 +790,7 @@ let optimize_body body =
   let rec fix body =
     let next =
       body
+      |> rewrite_modulo_zero_tests
       |> fold_assignment_temps
       |> local_pass
       |> propagate_constants
@@ -767,7 +824,7 @@ let optimize_body body =
    ===================================================== *)
 
 let reexecutable_condition = function
-  | ILoad _ | IUnaryOp _ | IBinOp _ | IShiftLeft _ | ILoadGlobal _ -> true
+  | ILoad _ | IUnaryOp _ | IBinOp _ | IShiftLeft _ | IBitAnd _ | ILoadGlobal _ -> true
   | ILoadParam _ | IStoreGlobal _ | ICall _ | ILabel _ | IJump _ | IBranchZero _
   | IBranchNonZero _ | IReturn _ -> false
 
@@ -1036,9 +1093,27 @@ let remove_unreachable_funcs funcs =
    immediately fold the temporary back into an immediate.
    ===================================================== *)
 
+let is_comparison = function
+  | A.Lt | A.Gt | A.Le | A.Ge | A.Eq | A.Ne -> true
+  | _ -> false
+
+(* A comparison whose only consumer is a branch is emitted as a conditional
+   branch, and those compare two registers.  The immediate forms the backend
+   would otherwise use do not apply, so anything but zero costs an [li]. *)
+let branch_fused_comparisons (cfg : Cfg.t) =
+  let count = Array.length cfg.instrs in
+  Array.init count (fun index ->
+    match cfg.instrs.(index) with
+    | IBinOp (dst, op, _, _) when is_comparison op && index + 1 < count ->
+      (match cfg.instrs.(index + 1) with
+       | IBranchZero (Temp t, _) | IBranchNonZero (Temp t, _) -> t = dst
+       | _ -> false)
+    | _ -> false)
+
 let materialize_once body =
   let cfg = Cfg.build body in
   let doms = Cfg.dominators cfg in
+  let fused = branch_fused_comparisons cfg in
   let next_temp = ref (max_temp body + 1) in
   let try_loop (header, latch) =
     let nodes = Cfg.natural_loop cfg header latch in
@@ -1052,9 +1127,10 @@ let materialize_once body =
         wanted := (value, t) :: !wanted;
         t
     in
-    let lift op side operand =
+    let lift ~in_branch op side operand =
       match operand with
-      | Imm value when not (Target.immediate_is_free op side value) ->
+      | Imm 0 -> operand
+      | Imm value when in_branch || not (Target.immediate_is_free op side value) ->
         Temp (temp_for value)
       | operand -> operand
     in
@@ -1062,7 +1138,11 @@ let materialize_once body =
       List.mapi (fun index instr ->
         match instr with
         | IBinOp (dst, op, lhs, rhs) when IntSet.mem index nodes ->
-          IBinOp (dst, op, lift op Target.Left lhs, lift op Target.Right rhs)
+          let in_branch = fused.(index) in
+          IBinOp
+            (dst, op,
+             lift ~in_branch op Target.Left lhs,
+             lift ~in_branch op Target.Right rhs)
         | instr -> instr
       ) body
     in

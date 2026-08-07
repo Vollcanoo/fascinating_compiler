@@ -25,6 +25,8 @@ type instr =
   | IBinOp of int * bin_op * operand * operand
   (* dst <- src << amount; produced by strength reduction *)
   | IShiftLeft of int * operand * int
+  (* dst <- src & mask; produced when a remainder is only tested against zero *)
+  | IBitAnd of int * operand * int
   | ICall of int option * string * operand list
   | ILabel of label
   | IJump of label
@@ -105,7 +107,8 @@ let instr_dest = function
   | ILoadGlobal (dst, _)
   | IUnaryOp (dst, _, _)
   | IBinOp (dst, _, _, _)
-  | IShiftLeft (dst, _, _) -> Some dst
+  | IShiftLeft (dst, _, _)
+  | IBitAnd (dst, _, _) -> Some dst
   | ICall (dst, _, _) -> dst
   | IStoreGlobal _ | ILabel _ | IJump _ | IBranchZero _ | IBranchNonZero _
   | IReturn _ -> None
@@ -114,6 +117,7 @@ let instr_operands = function
   | ILoad (_, operand)
   | IUnaryOp (_, _, operand)
   | IShiftLeft (_, operand, _)
+  | IBitAnd (_, operand, _)
   | IStoreGlobal (_, operand)
   | IBranchZero (operand, _)
   | IBranchNonZero (operand, _) -> [operand]
@@ -126,6 +130,7 @@ let map_operands f = function
   | ILoad (dst, operand) -> ILoad (dst, f operand)
   | IUnaryOp (dst, op, operand) -> IUnaryOp (dst, op, f operand)
   | IShiftLeft (dst, operand, amount) -> IShiftLeft (dst, f operand, amount)
+  | IBitAnd (dst, operand, mask) -> IBitAnd (dst, f operand, mask)
   | IStoreGlobal (name, operand) -> IStoreGlobal (name, f operand)
   | IBinOp (dst, op, lhs, rhs) -> IBinOp (dst, op, f lhs, f rhs)
   | IBranchZero (operand, label) -> IBranchZero (f operand, label)

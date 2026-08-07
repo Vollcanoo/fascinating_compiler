@@ -258,6 +258,15 @@ let emit_shift_left ctx dst operand amount =
   let load, reg = operand_reg ctx "t0" operand in
   load @ emit_slli target reg amount @ store_result ctx target dst
 
+let emit_bit_and ctx dst operand mask =
+  let target = result_reg ctx dst "t2" in
+  let load, reg = operand_reg ctx "t0" operand in
+  let code =
+    if fits12 mask then line "  andi %s, %s, %d" target reg mask
+    else emit_li "t1" mask @ line "  and %s, %s, t1" target reg
+  in
+  load @ code @ store_result ctx target dst
+
 (* =====================================================
    Branches
 
@@ -373,6 +382,7 @@ let emit_instr ctx = function
   | IUnaryOp (dst, op, operand) -> emit_unaryop ctx dst op operand
   | IBinOp (dst, op, lhs, rhs) -> emit_binop ctx dst op lhs rhs
   | IShiftLeft (dst, operand, amount) -> emit_shift_left ctx dst operand amount
+  | IBitAnd (dst, operand, mask) -> emit_bit_and ctx dst operand mask
   | ICall (dst, name, args) -> emit_call ctx dst name args
   | ILabel label -> line "%s:" label
   | IJump label -> line "  j %s" label

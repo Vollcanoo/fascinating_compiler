@@ -121,9 +121,21 @@ let build_graph (cfg : Cfg.t) (liveness : Liveness.t) body =
     graph := add_node !graph t
   done;
   Array.iteri (fun index defs ->
+    (* A register copy does not make its two ends conflict: right after
+       "dst = src" both hold the same value, so giving them one register just
+       turns the copy into a no-op.  Counting the copy itself as interference
+       is what would keep an induction variable and its incremented value in
+       separate registers, leaving a mv in the loop forever.  If they ever stop
+       agreeing, the redefinition adds the edge at that point. *)
+    let copy_source =
+      match cfg.instrs.(index) with
+      | ILoad (_, Temp src) -> Some src
+      | _ -> None
+    in
     IntSet.iter (fun def ->
-      IntSet.iter (fun live -> graph := add_edge !graph def live)
-        liveness.Liveness.live_out.(index)
+      IntSet.iter (fun live ->
+        if Some live <> copy_source then graph := add_edge !graph def live
+      ) liveness.Liveness.live_out.(index)
     ) defs
   ) cfg.defs;
   (* Every incoming argument is copied to its home at entry, including arguments

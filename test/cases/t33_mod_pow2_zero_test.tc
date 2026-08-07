@@ -1,0 +1,20 @@
+// EXPECT: 247
+// A remainder by a power of two can be computed with a bit mask when the only
+// thing anyone asks is whether it is zero. The sign-corrected value must still
+// be produced wherever it is actually observed: with_value returns -3, not 1.
+int mask_only(int x) {
+  if (x % 4 == 0) return 1;
+  return 0;
+}
+int with_value(int x) {
+  return x % 4;
+}
+int main() {
+  int c = 0;
+  int i = -8;
+  while (i <= 8) {
+    c = c + mask_only(i);
+    i = i + 4;
+  }
+  return c * 10 + with_value(-7) + 200;
+}
