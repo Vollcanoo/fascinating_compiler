@@ -353,6 +353,14 @@ let remove_redundant_jumps body =
   let rec loop acc = function
     | IJump target :: ILabel label :: rest when target = label ->
       loop (ILabel label :: acc) rest
+    (* "branch to the next label, otherwise jump away" is one inverted branch.
+       Every "if (c) break;" and "if (c) continue;" lowers to this shape. *)
+    | IBranchZero (operand, skipped) :: IJump target :: ILabel label :: rest
+      when skipped = label ->
+      loop (IBranchNonZero (operand, target) :: acc) (ILabel label :: rest)
+    | IBranchNonZero (operand, skipped) :: IJump target :: ILabel label :: rest
+      when skipped = label ->
+      loop (IBranchZero (operand, target) :: acc) (ILabel label :: rest)
     | instr :: rest -> loop (instr :: acc) rest
     | [] -> List.rev acc
   in
@@ -783,6 +791,105 @@ let licm body =
   fix body
 
 (* =====================================================
+   Promoting a global into a register across a loop
+
+   A global read or written in a loop costs an address materialisation plus a
+   memory access every iteration.  When nothing inside the loop can observe the
+   memory location, the value can be loaded once into a register before the
+   loop, worked on there, and written back on the way out.
+
+   The conditions are what make the write-back reachable:
+
+   - No call in the loop.  A callee could read or write the same global and
+     would see a stale value.
+   - No return in the loop.  A return would leave with the register holding the
+     current value and memory still holding the old one.
+   - Exactly one edge leaving the loop, and it leaves from the latch.  The
+     write-back is placed on that edge, so a break or a continue — either of
+     which shows up here as a second exiting edge — would jump straight past it.
+
+   A guard that skips the whole loop is fine: it jumps past the pre-loop load
+   as well, so nothing was ever cached.
+   ===================================================== *)
+
+let promote_loop_globals_once body =
+  let cfg = Cfg.build body in
+  let count = Array.length cfg.instrs in
+  let doms = Cfg.dominators cfg in
+  let try_loop (header, latch) =
+    let nodes = Cfg.natural_loop cfg header latch in
+    let leaves node = List.exists (fun succ -> not (IntSet.mem succ nodes)) cfg.succs.(node) in
+    let exits =
+      IntSet.fold (fun node acc ->
+        List.fold_left
+          (fun acc succ -> if IntSet.mem succ nodes then acc else IntSet.add succ acc)
+          acc cfg.succs.(node)
+      ) nodes IntSet.empty
+    in
+    let exiting = IntSet.filter leaves nodes in
+    let observable =
+      IntSet.exists (fun node ->
+        match cfg.instrs.(node) with ICall _ | IReturn _ -> true | _ -> false) nodes
+    in
+    let written =
+      IntSet.fold (fun node acc ->
+        match cfg.instrs.(node) with
+        | IStoreGlobal (name, _) -> StringSet.add name acc
+        | _ -> acc
+      ) nodes StringSet.empty
+    in
+    match
+      cfg.instrs.(header), cfg.instrs.(latch),
+      IntSet.elements exits, IntSet.elements exiting
+    with
+    | ILabel _, (IBranchZero _ | IBranchNonZero _), [exit], [exiting_node]
+      when exiting_node = latch
+           && exit = latch + 1
+           && exit < count
+           && not observable
+           && not (StringSet.is_empty written) ->
+      Some (header, latch, nodes, StringSet.elements written)
+    | _ -> None
+  in
+  match List.find_map try_loop (Cfg.back_edges cfg doms) with
+  | None -> body
+  | Some (header, latch, nodes, globals) ->
+    let next_temp = ref (max_temp body + 1) in
+    let caches =
+      List.map (fun name ->
+        let t = !next_temp in
+        incr next_temp;
+        (name, t)
+      ) globals
+    in
+    let cache name = List.assoc name caches in
+    let loads = List.map (fun (name, t) -> ILoadGlobal (t, name)) caches in
+    let writebacks = List.map (fun (name, t) -> IStoreGlobal (name, Temp t)) caches in
+    body
+    |> List.mapi (fun index instr ->
+      let instr =
+        if not (IntSet.mem index nodes) then instr
+        else
+          match instr with
+          | ILoadGlobal (dst, name) when List.mem_assoc name caches ->
+            ILoad (dst, Temp (cache name))
+          | IStoreGlobal (name, operand) when List.mem_assoc name caches ->
+            ILoad (cache name, operand)
+          | instr -> instr
+      in
+      if index = header then loads @ [instr]
+      else if index = latch then instr :: writebacks
+      else [instr])
+    |> List.concat
+
+let promote_loop_globals body =
+  let rec fix body =
+    let next = promote_loop_globals_once body in
+    if next = body then body else fix next
+  in
+  fix body
+
+(* =====================================================
    Per-function fixpoint
    ===================================================== *)
 
@@ -797,6 +904,7 @@ let optimize_body body =
       |> cleanup_control_flow
       |> global_cse
       |> licm
+      |> promote_loop_globals
       |> eliminate_dead_defs
       |> eliminate_dead_stores
       |> cleanup_control_flow

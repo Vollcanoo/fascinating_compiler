@@ -1,0 +1,14 @@
+// Global accumulators in a tight loop. Without register promotion every read
+// and write costs an address materialisation plus a memory access, so the loop
+// body is dominated by la/lw/sw rather than by the arithmetic.
+int total = 0;
+int counter = 0;
+int main() {
+  int i = 0;
+  while (i < 300000) {
+    total = total + i;
+    counter = counter + 1;
+    i = i + 1;
+  }
+  return (total + counter) % 251;
+}

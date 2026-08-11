@@ -1,0 +1,43 @@
+// EXPECT: 152
+// A global may only live in a register across a loop while nothing inside can
+// observe memory and nothing can leave the loop without passing the write-back.
+int g = 0;
+
+// Not tail recursive, so it never collapses into a loop and never becomes
+// inlinable: the call really does stay inside with_call's loop.
+int reads_g(int n) {
+  if (n <= 0) return g;
+  return reads_g(n - 1) + g;
+}
+
+// A break leaves the loop without passing the write-back point, so the last
+// increment would be lost if g were cached.
+int with_break(int n) {
+  int i = 0;
+  while (i < n) {
+    g = g + 1;
+    if (g > 3) break;
+    i = i + 1;
+  }
+  return g;
+}
+
+// The callee reads the same global, so it must see every increment as it lands
+// in memory rather than a value parked in a register.
+int with_call(int n) {
+  int i = 0;
+  int s = 0;
+  while (i < n) {
+    g = g + 1;
+    s = s + reads_g(1);
+    i = i + 1;
+  }
+  return s;
+}
+
+int main() {
+  int a = with_break(10);
+  g = 0;
+  int b = with_call(3);
+  return a * 10 + b + 100;
+}
