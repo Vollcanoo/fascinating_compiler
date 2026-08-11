@@ -1,0 +1,55 @@
+// EXPECT: 1052
+// A loop counter's remainder is carried incrementally instead of recomputed
+// each iteration. That rests on two conditions, and the shapes that break
+// either of them must still follow C exactly.
+
+// Both hold: the counter starts at zero and steps by less than the modulus.
+int carried() {
+  int i = 0;
+  int s = 0;
+  while (i < 20) {
+    s = s + (i % 7) * (i + 1);
+    i = i + 1;
+  }
+  return s;
+}
+
+// The counter starts negative, so C's remainder is negative for a while. A
+// running value kept in [0, k) would not track it.
+int negative_start() {
+  int i = -5;
+  int s = 0;
+  while (i < 5) {
+    s = s + (i % 3) * (i + 7);
+    i = i + 1;
+  }
+  return s;
+}
+
+// The step is larger than the modulus, so the running value could jump clear
+// past it and a single conditional subtraction would not bring it back.
+int big_step() {
+  int i = 0;
+  int s = 0;
+  while (i < 40) {
+    s = s + (i % 3) * (i + 1);
+    i = i + 5;
+  }
+  return s;
+}
+
+// A power-of-two modulus on a non-negative counter is already a single mask,
+// so carrying a running value would cost more than it saves.
+int masked() {
+  int i = 0;
+  int s = 0;
+  while (i < 16) {
+    s = s + (i % 4) * (i + 1);
+    i = i + 1;
+  }
+  return s;
+}
+
+int main() {
+  return carried() + negative_start() + big_step() + masked();
+}

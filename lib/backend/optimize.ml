@@ -146,6 +146,163 @@ let simplify_mul_high dst lhs rhs =
   | _ -> [IMulHigh (dst, lhs, rhs)]
 
 (* =====================================================
+   Values that cannot be negative
+
+   Truncation towards zero is what makes signed division expensive: "x / 2^k"
+   needs a bias added before the shift, "x % 2^k" needs that plus a subtract,
+   and the reciprocal sequence needs a final sign correction.  Every one of
+   those steps is dead code when the dividend cannot be negative.
+
+   Two sources are worth proving.  The first is structural: masks, comparison
+   results and non-negative constants.  The second is loop counters, which is
+   where it actually pays, and which needs an argument about overflow rather
+   than just about the initial value.
+   ===================================================== *)
+
+(* A loop counter is non-negative for the whole loop when it starts non-negative,
+   only ever grows, and the loop test keeps it under a constant ceiling low
+   enough that the next increment cannot wrap into the negatives.  Drop any of
+   those three and the guarantee is gone: an unbounded counter eventually
+   overflows, and overflow is exactly the case being relied upon not to happen. *)
+type counted_loop = {
+  loop_header : int;
+  loop_nodes : IntSet.t;
+  counter : int;
+  step : int;
+  update_index : int;
+}
+
+let counted_loops body =
+  let cfg = Cfg.build body in
+  let count = Array.length cfg.instrs in
+  let doms = Cfg.dominators cfg in
+  let indices = List.init count (fun i -> i) in
+  let definitions t = List.filter (fun i -> instr_dest cfg.instrs.(i) = Some t) indices in
+  let counters = ref [] in
+  List.iter (fun (header, latch) ->
+    let nodes = Cfg.natural_loop cfg header latch in
+    let starts_non_negative index =
+      match cfg.instrs.(index) with ILoad (_, Imm n) -> n >= 0 | _ -> false
+    in
+    (* Cfg.successors puts a branch's taken edge first, so this is the back edge. *)
+    let branches_to_header =
+      match cfg.succs.(latch) with taken :: _ -> taken = header | [] -> false
+    in
+    match cfg.instrs.(latch) with
+    | IBranchNonZero (Temp condition, _) when branches_to_header ->
+      (* Loop rotation duplicates the condition, so the test temporary has a
+         definition in the preheader as well.  The one that reaches the latch is
+         the one inside the loop that dominates it. *)
+      (match
+         List.filter
+           (fun i -> IntSet.mem i nodes && Cfg.dominates doms i latch)
+           (definitions condition)
+       with
+       | [test] ->
+         (match cfg.instrs.(test) with
+          | IBinOp (_, (A.Lt | A.Le), Temp tested, Imm ceiling) ->
+            (* When the increment is shared with another use it survives as
+               "t = i + step; i = t", and copy propagation then rewrites the
+               test to read t rather than i.  So the counter is either the
+               tested value itself or something the tested value is copied
+               into. *)
+            let candidates =
+              tested
+              :: List.filter_map (fun index ->
+                match cfg.instrs.(index) with
+                | ILoad (dst, Temp source) when source = tested && IntSet.mem index nodes ->
+                  Some dst
+                | _ -> None) indices
+            in
+            let try_counter counter =
+              let inside, outside =
+                List.partition (fun i -> IntSet.mem i nodes) (definitions counter)
+              in
+              let increment_step = function
+                | IBinOp (_, A.Add, Temp base, Imm step) when base = counter -> Some step
+                | _ -> None
+              in
+              let step_of index =
+                match cfg.instrs.(index) with
+                | ILoad (_, Temp source) when source <> counter ->
+                  (match
+                     List.filter (fun d -> IntSet.mem d nodes) (definitions source)
+                   with
+                   | [definition] -> increment_step cfg.instrs.(definition)
+                   | _ -> None)
+                | instr -> increment_step instr
+              in
+              match inside with
+              | [update] ->
+                (match step_of update with
+                 | Some step
+                   when step > 0
+                        (* The body only runs while the counter is under the
+                           ceiling, so its largest value is ceiling + step. *)
+                        && ceiling <= max_i32 - step
+                        && outside <> []
+                        && List.for_all starts_non_negative outside ->
+                   Some
+                     { loop_header = header; loop_nodes = nodes; counter; step;
+                       update_index = update }
+                 | _ -> None)
+              | _ -> None
+            in
+            (match List.find_map try_counter candidates with
+             | Some loop -> counters := loop :: !counters
+             | None -> ())
+          | _ -> ())
+       | _ -> ())
+    | _ -> ()
+  ) (Cfg.back_edges cfg doms);
+  !counters
+
+let counted_loop_counters body =
+  List.fold_left (fun set loop -> IntSet.add loop.counter set) IntSet.empty
+    (counted_loops body)
+
+(* Flow-insensitive: a temporary counts as non-negative only when every
+   definition of it produces a non-negative value.  Coarse, but sound, and it
+   composes -- a mask of a counter is still non-negative. *)
+let non_negative_temps body =
+  let definitions = Hashtbl.create 64 in
+  List.iter (fun instr ->
+    match instr_dest instr with
+    | Some dst ->
+      Hashtbl.replace definitions dst (instr :: (Hashtbl.find_opt definitions dst |> Option.value ~default:[]))
+    | None -> ()
+  ) body;
+  let known = ref (counted_loop_counters body) in
+  let operand_known = function
+    | Imm n -> n >= 0
+    | Temp t -> IntSet.mem t !known
+  in
+  let produces = function
+    | ILoad (_, operand) -> operand_known operand
+    | IBitAnd (_, _, mask) -> mask >= 0
+    (* A logical shift by at least one clears the sign bit. *)
+    | IShiftRightLogic (_, _, amount) -> amount >= 1
+    | IShiftRightArith (_, operand, _) -> operand_known operand
+    (* Comparisons and the logical connectives yield 0 or 1. *)
+    | IBinOp (_, (A.Lt | A.Gt | A.Le | A.Ge | A.Eq | A.Ne | A.And | A.Or), _, _) -> true
+    (* A remainder takes the sign of its dividend, whatever the divisor's. *)
+    | IBinOp (_, A.Mod, dividend, _) -> operand_known dividend
+    | IBinOp (_, A.Div, dividend, Imm d) -> d > 0 && operand_known dividend
+    | _ -> false
+  in
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    Hashtbl.iter (fun t defs ->
+      if (not (IntSet.mem t !known)) && List.for_all produces defs then begin
+        known := IntSet.add t !known;
+        changed := true
+      end
+    ) definitions
+  done;
+  !known
+
+(* =====================================================
    Division and remainder by a constant
 
    Expanding the reciprocal sequence here rather than in the backend is what
@@ -155,24 +312,28 @@ let simplify_mul_high dst lhs rhs =
    gets hoisted out of the loop.
    ===================================================== *)
 
-let quotient_instrs fresh dst dividend d =
+let quotient_instrs fresh ~non_negative dst dividend d =
   let magnitude = abs d in
   if Target.is_power_of_two magnitude then begin
-    (* Truncation towards zero means a negative dividend needs the 2^k-1 bias
-       added before the arithmetic shift. *)
     let amount = Target.log2 magnitude in
-    let sign = fresh () and bias = fresh () and biased = fresh () in
-    let prefix =
-      [ IShiftRightArith (sign, dividend, 31);
-        IShiftRightLogic (bias, Temp sign, 32 - amount);
-        IBinOp (biased, A.Add, dividend, Temp bias) ]
+    let shift_down target =
+      if non_negative then
+        (* Nothing to round: a non-negative dividend shifts straight down. *)
+        [IShiftRightArith (target, dividend, amount)]
+      else
+        (* Truncation towards zero means a negative dividend needs the 2^k-1
+           bias added before the arithmetic shift. *)
+        let sign = fresh () and bias = fresh () and biased = fresh () in
+        [ IShiftRightArith (sign, dividend, 31);
+          IShiftRightLogic (bias, Temp sign, 32 - amount);
+          IBinOp (biased, A.Add, dividend, Temp bias);
+          IShiftRightArith (target, Temp biased, amount) ]
     in
-    if d > 0 then prefix @ [IShiftRightArith (dst, Temp biased, amount)]
+    if d > 0 then shift_down dst
     else
       let magnitude_quotient = fresh () in
-      prefix
-      @ [ IShiftRightArith (magnitude_quotient, Temp biased, amount);
-          IUnaryOp (dst, A.UMinus, Temp magnitude_quotient) ]
+      shift_down magnitude_quotient
+      @ [IUnaryOp (dst, A.UMinus, Temp magnitude_quotient)]
   end
   else
     match Target.division_magic d with
@@ -194,18 +355,109 @@ let quotient_instrs fresh dst dividend d =
         step (fun next source -> IBinOp (next, A.Sub, source, dividend));
       if shift > 0 then
         step (fun next source -> IShiftRightArith (next, source, shift));
-      let sign = fresh () in
-      !instrs
-      @ [ IShiftRightLogic (sign, Temp !current, 31);
-          IBinOp (dst, A.Add, Temp !current, Temp sign) ]
+      (* The shift floors, and flooring only differs from truncation for a
+         negative quotient.  A non-negative dividend over a positive divisor
+         cannot produce one. *)
+      if non_negative && d > 0 then !instrs @ move_or_nop dst (Temp !current)
+      else
+        let sign = fresh () in
+        !instrs
+        @ [ IShiftRightLogic (sign, Temp !current, 31);
+            IBinOp (dst, A.Add, Temp !current, Temp sign) ]
 
-let remainder_instrs fresh dst dividend d =
-  let quotient = fresh () and product = fresh () in
-  quotient_instrs fresh quotient dividend d
-  (* The multiply by a constant is strength reduced to shifts on the next
-     round, so this rarely stays a mul. *)
-  @ [ IBinOp (product, A.Mul, Temp quotient, Imm d);
-      IBinOp (dst, A.Sub, dividend, Temp product) ]
+let remainder_instrs fresh ~non_negative dst dividend d =
+  let magnitude = abs d in
+  if non_negative && Target.is_power_of_two magnitude then
+    (* The remainder takes the sign of the dividend, so for a non-negative one
+       the low bits are the whole answer whichever sign the divisor has. *)
+    [IBitAnd (dst, dividend, magnitude - 1)]
+  else
+    let quotient = fresh () and product = fresh () in
+    quotient_instrs fresh ~non_negative quotient dividend d
+    (* The multiply by a constant is strength reduced to shifts on the next
+       round, so this rarely stays a mul. *)
+    @ [ IBinOp (product, A.Mul, Temp quotient, Imm d);
+        IBinOp (dst, A.Sub, dividend, Temp product) ]
+
+(* =====================================================
+   Strength reduction of a loop counter's remainder
+
+   "i % k" where i is a counter stepping by a constant is itself periodic: it
+   walks 0, 1, ... k-1, 0, ... So instead of recomputing a reciprocal every
+   iteration, carry the remainder alongside the counter and wrap it by hand.
+   This is the modulo analogue of the classic strength reduction that turns
+   "i * k" into an accumulator.
+
+   Correctness rests on the counter being non-negative -- otherwise C's
+   remainder changes sign and the running value would not track it -- and on
+   0 < step < k, which is what makes a single conditional subtraction enough to
+   bring the sum back into range.
+
+   Only worth it when the remainder is expensive: a power-of-two modulus of a
+   non-negative counter is already a single mask.
+   ===================================================== *)
+
+let strength_reduce_modulo_once body =
+  let cfg = Cfg.build body in
+  let modulus_in loop =
+    IntSet.elements loop.loop_nodes
+    |> List.find_map (fun index ->
+      match cfg.instrs.(index) with
+      | IBinOp (_, A.Mod, Temp t, Imm k)
+        when t = loop.counter
+             && abs k > 1
+             && loop.step < abs k
+             && not (Target.is_power_of_two (abs k)) -> Some (abs k)
+      | _ -> None)
+  in
+  match List.find_map (fun loop ->
+    match modulus_in loop with
+    | Some modulus -> Some (loop, modulus)
+    | None -> None
+  ) (counted_loops body)
+  with
+  | None -> body
+  | Some (loop, modulus) ->
+    let next_temp = ref (max_temp body + 1) in
+    let fresh () =
+      let t = !next_temp in
+      incr next_temp;
+      t
+    in
+    let labels = labels_in_body body in
+    let rec fresh_label base =
+      if StringSet.mem base labels then fresh_label (base ^ "_next") else base
+    in
+    let wrapped = fresh_label (Printf.sprintf ".L_mod%d_wrapped" modulus) in
+    let running = fresh () in
+    let in_range = fresh () in
+    (* Seeded once on entry with a real remainder; from then on it is carried. *)
+    let seed = [IBinOp (running, A.Mod, Temp loop.counter, Imm modulus)] in
+    let advance =
+      [ IBinOp (running, A.Add, Temp running, Imm loop.step);
+        IBinOp (in_range, A.Lt, Temp running, Imm modulus);
+        IBranchNonZero (Temp in_range, wrapped);
+        IBinOp (running, A.Sub, Temp running, Imm modulus);
+        ILabel wrapped ]
+    in
+    body
+    |> List.mapi (fun index instr ->
+      if index = loop.loop_header then seed @ [instr]
+      else if index = loop.update_index then instr :: advance
+      else if IntSet.mem index loop.loop_nodes then
+        match instr with
+        | IBinOp (dst, A.Mod, Temp t, Imm k)
+          when t = loop.counter && abs k = modulus -> [ILoad (dst, Temp running)]
+        | instr -> [instr]
+      else [instr])
+    |> List.concat
+
+let strength_reduce_modulo body =
+  let rec fix body =
+    let next = strength_reduce_modulo_once body in
+    if next = body then body else fix next
+  in
+  fix body
 
 let expand_constant_division body =
   let next_temp = ref (max_temp body + 1) in
@@ -214,15 +466,20 @@ let expand_constant_division body =
     incr next_temp;
     t
   in
+  let known_non_negative = non_negative_temps body in
+  let non_negative = function
+    | Imm n -> n >= 0
+    | Temp t -> IntSet.mem t known_non_negative
+  in
   (* Zero and the identities are already handled by algebraic simplification,
      and INT_MIN is left to the hardware instruction. *)
   let expandable d = d <> 0 && d <> 1 && d <> (-1) && d <> min_i32 in
   body
   |> List.concat_map (function
     | IBinOp (dst, A.Div, dividend, Imm d) when expandable d ->
-      quotient_instrs fresh dst dividend d
+      quotient_instrs fresh ~non_negative:(non_negative dividend) dst dividend d
     | IBinOp (dst, A.Mod, dividend, Imm d) when expandable d ->
-      remainder_instrs fresh dst dividend d
+      remainder_instrs fresh ~non_negative:(non_negative dividend) dst dividend d
     | instr -> [instr])
 
 (* =====================================================
@@ -1045,6 +1302,9 @@ let optimize_body body =
       |> rewrite_modulo_zero_tests
       |> fold_assignment_temps
       |> local_pass
+      (* Before the reciprocal expansion, which would otherwise bury the
+         remainder in a multiply sequence this can no longer recognise. *)
+      |> strength_reduce_modulo
       (* After local_pass, so a divisor that only became constant through
          propagation is still expanded. *)
       |> expand_constant_division

@@ -31,15 +31,18 @@ let distinct_homes message allocation a b =
 (* Mirrors the sequence Optimize.quotient_instrs emits, step for step and with
    the same 32-bit wrapping, so this checks the arithmetic the compiler will
    actually run rather than a restatement of it. *)
-let quotient_model d n =
+let quotient_model ~non_negative d n =
   let magnitude = abs d in
   if Target.is_power_of_two magnitude then begin
     let amount = Target.log2 magnitude in
-    let sign = Ir.apply_shift_right_arith n 31 in
-    let bias = Ir.apply_shift_right_logic sign (32 - amount) in
-    let biased = Ir.i32 (n + bias) in
-    let magnitude_quotient = Ir.apply_shift_right_arith biased amount in
-    if d > 0 then Some magnitude_quotient else Some (Ir.apply_unary Ast.UMinus magnitude_quotient)
+    let shifted =
+      if non_negative then Ir.apply_shift_right_arith n amount
+      else
+        let sign = Ir.apply_shift_right_arith n 31 in
+        let bias = Ir.apply_shift_right_logic sign (32 - amount) in
+        Ir.apply_shift_right_arith (Ir.i32 (n + bias)) amount
+    in
+    if d > 0 then Some shifted else Some (Ir.apply_unary Ast.UMinus shifted)
   end
   else
     match Target.division_magic d with
@@ -52,10 +55,11 @@ let quotient_model d n =
         else high
       in
       let high = if shift > 0 then Ir.apply_shift_right_arith high shift else high in
-      let sign = Ir.apply_shift_right_logic high 31 in
-      Some (Ir.i32 (high + sign))
+      if non_negative && d > 0 then Some high
+      else Some (Ir.i32 (high + Ir.apply_shift_right_logic high 31))
 
 let true_quotient d n = Int32.(to_int (div (of_int n) (of_int d)))
+let true_remainder d n = Int32.(to_int (rem (of_int n) (of_int d)))
 
 let () =
   (* Division by a constant is replaced by a multiply-and-shift sequence, which
@@ -79,15 +83,36 @@ let () =
   for d = -300 to 300 do
     if d <> 0 && d <> 1 && d <> -1 && d <> Ir.min_i32 then
       List.iter (fun n ->
-        match quotient_model d n with
-        | None -> ()
-        | Some got ->
-          incr checked;
-          let want = true_quotient d n in
-          if got <> want then
-            failwith
-              (Printf.sprintf "constant division wrong: %d / %d gave %d, want %d"
-                 n d got want)
+        (match quotient_model ~non_negative:false d n with
+         | None -> ()
+         | Some got ->
+           incr checked;
+           if got <> true_quotient d n then
+             failwith
+               (Printf.sprintf "constant division wrong: %d / %d gave %d, want %d"
+                  n d got (true_quotient d n)));
+        (* The shorter sequence used when the dividend is provably non-negative
+           has to agree with the general one, not merely be close. *)
+        if n >= 0 then begin
+          (match quotient_model ~non_negative:true d n with
+           | None -> ()
+           | Some got ->
+             incr checked;
+             if got <> true_quotient d n then
+               failwith
+                 (Printf.sprintf
+                    "non-negative division wrong: %d / %d gave %d, want %d" n d got
+                    (true_quotient d n)));
+          if Target.is_power_of_two (abs d) then begin
+            incr checked;
+            let got = n land (abs d - 1) in
+            if got <> true_remainder d n then
+              failwith
+                (Printf.sprintf
+                   "non-negative masked remainder wrong: %d %% %d gave %d, want %d"
+                   n d got (true_remainder d n))
+          end
+        end
       ) dividends
   done;
   if !checked < 100000 then
