@@ -54,7 +54,7 @@ let declared_expectation (source : string) : int option =
   scan lines
 
 type outcome =
-  | Pass of int (* instructions retired *)
+  | Pass of int * int (* instructions retired, modelled cycles *)
   | Fail of string
 
 let check_one ~opt ~source ~reference =
@@ -66,7 +66,8 @@ let check_one ~opt ~source ~reference =
      | exception e -> Fail (Printf.sprintf "simulate: %s" (Printexc.to_string e))
      | result ->
        let want = reference land 0xFF in
-       if result.Rv32.exit_code = want then Pass result.Rv32.retired
+       if result.Rv32.exit_code = want then
+         Pass (result.Rv32.retired, result.Rv32.cycles)
        else
          Fail
            (Printf.sprintf "exit code %d, expected %d" result.Rv32.exit_code want))
@@ -118,8 +119,11 @@ let () =
   let failures = ref 0 in
   let total_plain = ref 0 in
   let total_opt = ref 0 in
-  Printf.printf "%-28s %10s %10s  %s\n" "case" "base" "-opt" "status";
-  Printf.printf "%s\n" (String.make 66 '-');
+  let cycles_plain = ref 0 in
+  let cycles_opt = ref 0 in
+  Printf.printf "%-28s %10s %10s %10s %10s  %s\n" "case" "base" "-opt"
+    "base~cyc" "-opt~cyc" "status";
+  Printf.printf "%s\n" (String.make 86 '-');
   List.iter
     (fun path ->
       let name = Filename.remove_extension (Filename.basename path) in
@@ -148,22 +152,28 @@ let () =
            in
            let plain = check_one ~opt:false ~source ~reference in
            let opted = check_one ~opt:true ~source ~reference in
-           let cell = function Pass n -> string_of_int n | Fail _ -> "-" in
+           let retired = function Pass (n, _) -> string_of_int n | Fail _ -> "-" in
+           let cycles = function Pass (_, c) -> string_of_int c | Fail _ -> "-" in
            let status =
              match (declared_ok, plain, opted) with
              | Some msg, _, _ -> "FAIL  " ^ msg
              | None, Fail m, _ -> "FAIL  base: " ^ m
              | None, _, Fail m -> "FAIL  -opt: " ^ m
-             | None, Pass a, Pass b ->
+             | None, Pass (a, ca), Pass (b, cb) ->
                total_plain := !total_plain + a;
                total_opt := !total_opt + b;
+               cycles_plain := !cycles_plain + ca;
+               cycles_opt := !cycles_opt + cb;
                "ok"
            in
            if status <> "ok" then incr failures;
-           Printf.printf "%-28s %10s %10s  %s\n" name (cell plain) (cell opted)
-             status))
+           Printf.printf "%-28s %10s %10s %10s %10s  %s\n" name (retired plain)
+             (retired opted) (cycles plain) (cycles opted) status))
     cases;
-  Printf.printf "%s\n" (String.make 66 '-');
-  Printf.printf "%-28s %10d %10d\n" "TOTAL retired" !total_plain !total_opt;
+  Printf.printf "%s\n" (String.make 86 '-');
+  Printf.printf "%-28s %10d %10d %10d %10d\n" "TOTAL" !total_plain !total_opt
+    !cycles_plain !cycles_opt;
+  Printf.printf
+    "retired instructions, and modelled cycles (div/rem 25, mul 3, load 2, else 1)\n";
   Printf.printf "%d case(s), %d failure(s)\n" (List.length cases) !failures;
   if !failures > 0 then exit 1

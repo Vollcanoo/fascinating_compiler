@@ -74,6 +74,71 @@ let divides_by_shift imm =
   is_power_of_two imm || (imm <> min_i32 && imm < 0 && is_power_of_two (-imm))
 
 (* =====================================================
+   Division by a constant
+
+   RV32 has no fast divider: div and rem run for tens of cycles while mulh
+   costs a handful.  When the divisor is known, the quotient can be produced by
+   multiplying by a fixed-point reciprocal instead.
+
+   [magic d] is Hacker's Delight figure 10-1.  It searches for the smallest
+   multiplier/shift pair for which
+
+     (mulhs(M, n) [+/- n]) >> s, plus the sign bit
+
+   equals n / d for *every* 32-bit n, which is what makes the substitution safe
+   rather than merely usually right.  Arithmetic below is unsigned 32-bit, held
+   in OCaml's wider native int and masked back at each step.
+   ===================================================== *)
+
+type magic = {
+  multiplier : int;
+  shift : int;
+}
+
+let magic d =
+  let mask = 0xFFFFFFFF in
+  let two31 = 0x80000000 in
+  let truncate value = value land mask in
+  let signed value = if value >= two31 then value - (mask + 1) else value in
+  let ad = abs d in
+  (* nc is the largest n with the same sign as d for which n mod d <> 0 *)
+  let t = two31 + (if d < 0 then 1 else 0) in
+  let anc = t - 1 - (t mod ad) in
+  let p = ref 31 in
+  let q1 = ref (two31 / anc) in
+  let r1 = ref (two31 - (!q1 * anc)) in
+  let q2 = ref (two31 / ad) in
+  let r2 = ref (two31 - (!q2 * ad)) in
+  let settled = ref false in
+  while not !settled do
+    incr p;
+    q1 := truncate (!q1 * 2);
+    r1 := truncate (!r1 * 2);
+    if !r1 >= anc then begin
+      q1 := truncate (!q1 + 1);
+      r1 := !r1 - anc
+    end;
+    q2 := truncate (!q2 * 2);
+    r2 := truncate (!r2 * 2);
+    if !r2 >= ad then begin
+      q2 := truncate (!q2 + 1);
+      r2 := !r2 - ad
+    end;
+    let delta = ad - !r2 in
+    settled := not (!q1 < delta || (!q1 = delta && !r1 = 0))
+  done;
+  let multiplier = truncate (!q2 + 1) in
+  let multiplier = if d < 0 then truncate (- multiplier) else multiplier in
+  { multiplier = signed multiplier; shift = !p - 32 }
+
+(* Divisors the reciprocal trick does not cover: zero, the identities, and
+   INT_MIN, whose magnitude has no 32-bit positive representation. *)
+let division_magic d =
+  if d = 0 || d = 1 || d = -1 || d = min_i32 then None
+  else if is_power_of_two (abs d) then None
+  else Some (magic d)
+
+(* =====================================================
    Which immediates ride along inside the instruction
 
    [immediate_is_free op side imm] answers: given [imm] as the [side] operand of

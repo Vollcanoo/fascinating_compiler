@@ -300,8 +300,22 @@ let assemble (text : string) : program =
 
 type result = {
   exit_code : int;
-  retired : int; (* instructions retired: proxy for runtime *)
+  retired : int; (* instructions retired *)
+  cycles : int; (* modelled cycles: see instruction_cost *)
 }
+
+(* Retired instructions stop being a usable proxy for runtime once the compiler
+   starts trading instruction count for latency, which is exactly what replacing
+   a divide with a multiply-and-shift sequence does. This is a deliberately
+   crude in-order model -- no pipeline, no cache, no branch prediction -- but it
+   ranks those trades the right way round, which counting instructions does not.
+   Latencies are typical of a small in-order RV32IM core; a real divider is
+   anywhere from 16 to 40 cycles depending on the implementation. *)
+let instruction_cost = function
+  | Rop (("div" | "divu" | "rem" | "remu"), _, _, _) -> 25
+  | Rop (("mul" | "mulh" | "mulhu" | "mulhsu"), _, _, _) -> 3
+  | Lw _ -> 2
+  | _ -> 1
 
 let run ?(max_steps = 400_000_000) (prog : program) : result =
   let regs = Array.make 32 0 in
@@ -311,6 +325,7 @@ let run ?(max_steps = 400_000_000) (prog : program) : result =
   regs.(reg_ra) <- -1;
   let pc = ref prog.entry in
   let steps = ref 0 in
+  let cost = ref 0 in
   let set rd v = if rd <> 0 then regs.(rd) <- wrap v in
   let check_addr addr =
     if addr < 0 || addr + 4 > mem_size then
@@ -336,6 +351,7 @@ let run ?(max_steps = 400_000_000) (prog : program) : result =
       err "step limit exceeded after %d instructions (infinite loop?)" !steps;
     incr steps;
     let instr = prog.code.(!pc) in
+    cost := !cost + instruction_cost instr;
     incr pc;
     match instr with
     | Rop (op, rd, a, b) ->
@@ -409,6 +425,6 @@ let run ?(max_steps = 400_000_000) (prog : program) : result =
       pc := target
     | Ret -> pc := regs.(reg_ra)
   done;
-  { exit_code = regs.(reg_a0) land 0xFF; retired = !steps }
+  { exit_code = regs.(reg_a0) land 0xFF; retired = !steps; cycles = !cost }
 
 let simulate ?max_steps (asm : string) : result = run ?max_steps (assemble asm)

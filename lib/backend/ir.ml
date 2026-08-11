@@ -25,6 +25,12 @@ type instr =
   | IBinOp of int * bin_op * operand * operand
   (* dst <- src << amount; produced by strength reduction *)
   | IShiftLeft of int * operand * int
+  (* dst <- src >> amount, sign filling and zero filling respectively *)
+  | IShiftRightArith of int * operand * int
+  | IShiftRightLogic of int * operand * int
+  (* dst <- high 32 bits of the signed product; the core of division by a
+     constant, where a multiply by a fixed-point reciprocal replaces div *)
+  | IMulHigh of int * operand * operand
   (* dst <- src & mask; produced when a remainder is only tested against zero *)
   | IBitAnd of int * operand * int
   | ICall of int option * string * operand list
@@ -97,6 +103,16 @@ let apply_binary (op : bin_op) lhs rhs =
 let apply_shift_left value amount =
   Int32.(to_int (shift_left (of_int value) amount))
 
+let apply_shift_right_arith value amount =
+  Int32.(to_int (shift_right (of_int value) amount))
+
+let apply_shift_right_logic value amount =
+  Int32.(to_int (shift_right_logical (of_int value) amount))
+
+(* The product of two 32-bit values fits in 62 bits, so a native int holds it
+   exactly and the high word is just a shift away. *)
+let apply_mul_high lhs rhs = i32 ((i32 lhs * i32 rhs) asr 32)
+
 (* =====================================================
    Instruction shape helpers, shared by the CFG, the optimizer and the backend
    ===================================================== *)
@@ -108,6 +124,9 @@ let instr_dest = function
   | IUnaryOp (dst, _, _)
   | IBinOp (dst, _, _, _)
   | IShiftLeft (dst, _, _)
+  | IShiftRightArith (dst, _, _)
+  | IShiftRightLogic (dst, _, _)
+  | IMulHigh (dst, _, _)
   | IBitAnd (dst, _, _) -> Some dst
   | ICall (dst, _, _) -> dst
   | IStoreGlobal _ | ILabel _ | IJump _ | IBranchZero _ | IBranchNonZero _
@@ -117,11 +136,13 @@ let instr_operands = function
   | ILoad (_, operand)
   | IUnaryOp (_, _, operand)
   | IShiftLeft (_, operand, _)
+  | IShiftRightArith (_, operand, _)
+  | IShiftRightLogic (_, operand, _)
   | IBitAnd (_, operand, _)
   | IStoreGlobal (_, operand)
   | IBranchZero (operand, _)
   | IBranchNonZero (operand, _) -> [operand]
-  | IBinOp (_, _, lhs, rhs) -> [lhs; rhs]
+  | IBinOp (_, _, lhs, rhs) | IMulHigh (_, lhs, rhs) -> [lhs; rhs]
   | ICall (_, _, args) -> args
   | IReturn (Some operand) -> [operand]
   | ILoadParam _ | ILoadGlobal _ | ILabel _ | IJump _ | IReturn None -> []
@@ -130,9 +151,12 @@ let map_operands f = function
   | ILoad (dst, operand) -> ILoad (dst, f operand)
   | IUnaryOp (dst, op, operand) -> IUnaryOp (dst, op, f operand)
   | IShiftLeft (dst, operand, amount) -> IShiftLeft (dst, f operand, amount)
+  | IShiftRightArith (dst, operand, amount) -> IShiftRightArith (dst, f operand, amount)
+  | IShiftRightLogic (dst, operand, amount) -> IShiftRightLogic (dst, f operand, amount)
   | IBitAnd (dst, operand, mask) -> IBitAnd (dst, f operand, mask)
   | IStoreGlobal (name, operand) -> IStoreGlobal (name, f operand)
   | IBinOp (dst, op, lhs, rhs) -> IBinOp (dst, op, f lhs, f rhs)
+  | IMulHigh (dst, lhs, rhs) -> IMulHigh (dst, f lhs, f rhs)
   | IBranchZero (operand, label) -> IBranchZero (f operand, label)
   | IBranchNonZero (operand, label) -> IBranchNonZero (f operand, label)
   | ICall (dst, name, args) -> ICall (dst, name, List.map f args)

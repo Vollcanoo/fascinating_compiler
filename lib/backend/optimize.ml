@@ -127,6 +127,104 @@ let simplify_bit_and dst operand mask =
   | Imm value -> [ILoad (dst, Imm (value land mask))]
   | Temp _ -> [IBitAnd (dst, operand, mask)]
 
+let simplify_shift_right_arith dst operand amount =
+  match operand with
+  | Imm value -> [ILoad (dst, Imm (apply_shift_right_arith value amount))]
+  | Temp _ when amount = 0 -> move_or_nop dst operand
+  | Temp _ -> [IShiftRightArith (dst, operand, amount)]
+
+let simplify_shift_right_logic dst operand amount =
+  match operand with
+  | Imm value -> [ILoad (dst, Imm (apply_shift_right_logic value amount))]
+  | Temp _ when amount = 0 -> move_or_nop dst operand
+  | Temp _ -> [IShiftRightLogic (dst, operand, amount)]
+
+let simplify_mul_high dst lhs rhs =
+  match lhs, rhs with
+  | Imm a, Imm b -> [ILoad (dst, Imm (apply_mul_high a b))]
+  | (Imm 0, _ | _, Imm 0) -> [ILoad (dst, Imm 0)]
+  | _ -> [IMulHigh (dst, lhs, rhs)]
+
+(* =====================================================
+   Division and remainder by a constant
+
+   Expanding the reciprocal sequence here rather than in the backend is what
+   lets the rest of the pipeline see it: common subexpression elimination
+   shares the sign correction between a "/ k" and a "% k" on the same value,
+   and the multiplier itself becomes an ordinary loop-invariant constant that
+   gets hoisted out of the loop.
+   ===================================================== *)
+
+let quotient_instrs fresh dst dividend d =
+  let magnitude = abs d in
+  if Target.is_power_of_two magnitude then begin
+    (* Truncation towards zero means a negative dividend needs the 2^k-1 bias
+       added before the arithmetic shift. *)
+    let amount = Target.log2 magnitude in
+    let sign = fresh () and bias = fresh () and biased = fresh () in
+    let prefix =
+      [ IShiftRightArith (sign, dividend, 31);
+        IShiftRightLogic (bias, Temp sign, 32 - amount);
+        IBinOp (biased, A.Add, dividend, Temp bias) ]
+    in
+    if d > 0 then prefix @ [IShiftRightArith (dst, Temp biased, amount)]
+    else
+      let magnitude_quotient = fresh () in
+      prefix
+      @ [ IShiftRightArith (magnitude_quotient, Temp biased, amount);
+          IUnaryOp (dst, A.UMinus, Temp magnitude_quotient) ]
+  end
+  else
+    match Target.division_magic d with
+    | None -> [IBinOp (dst, A.Div, dividend, Imm d)]
+    | Some { Target.multiplier; shift } ->
+      let high = fresh () in
+      let instrs = ref [IMulHigh (high, Imm multiplier, dividend)] in
+      let current = ref high in
+      let step build =
+        let next = fresh () in
+        instrs := !instrs @ [build next (Temp !current)];
+        current := next
+      in
+      (* The reciprocal overflows into the sign bit for some divisors; the
+         dividend is added back (or subtracted) to compensate. *)
+      if d > 0 && multiplier < 0 then
+        step (fun next source -> IBinOp (next, A.Add, source, dividend));
+      if d < 0 && multiplier > 0 then
+        step (fun next source -> IBinOp (next, A.Sub, source, dividend));
+      if shift > 0 then
+        step (fun next source -> IShiftRightArith (next, source, shift));
+      let sign = fresh () in
+      !instrs
+      @ [ IShiftRightLogic (sign, Temp !current, 31);
+          IBinOp (dst, A.Add, Temp !current, Temp sign) ]
+
+let remainder_instrs fresh dst dividend d =
+  let quotient = fresh () and product = fresh () in
+  quotient_instrs fresh quotient dividend d
+  (* The multiply by a constant is strength reduced to shifts on the next
+     round, so this rarely stays a mul. *)
+  @ [ IBinOp (product, A.Mul, Temp quotient, Imm d);
+      IBinOp (dst, A.Sub, dividend, Temp product) ]
+
+let expand_constant_division body =
+  let next_temp = ref (max_temp body + 1) in
+  let fresh () =
+    let t = !next_temp in
+    incr next_temp;
+    t
+  in
+  (* Zero and the identities are already handled by algebraic simplification,
+     and INT_MIN is left to the hardware instruction. *)
+  let expandable d = d <> 0 && d <> 1 && d <> (-1) && d <> min_i32 in
+  body
+  |> List.concat_map (function
+    | IBinOp (dst, A.Div, dividend, Imm d) when expandable d ->
+      quotient_instrs fresh dst dividend d
+    | IBinOp (dst, A.Mod, dividend, Imm d) when expandable d ->
+      remainder_instrs fresh dst dividend d
+    | instr -> [instr])
+
 (* =====================================================
    Remainders that are only tested against zero
 
@@ -186,6 +284,9 @@ type expr_key =
   | EUnary of A.unary_op * operand
   | EBinary of A.bin_op * operand * operand
   | EShift of operand * int
+  | EShiftRightArith of operand * int
+  | EShiftRightLogic of operand * int
+  | EMulHigh of operand * operand
   | EBitAnd of operand * int
 
 module ExprMap = Map.Make (struct
@@ -228,6 +329,11 @@ let expr_of_instr = function
     let lhs, rhs = canonical_binop op lhs rhs in
     Some (EBinary (op, lhs, rhs))
   | IShiftLeft (_, operand, amount) -> Some (EShift (operand, amount))
+  | IShiftRightArith (_, operand, amount) -> Some (EShiftRightArith (operand, amount))
+  | IShiftRightLogic (_, operand, amount) -> Some (EShiftRightLogic (operand, amount))
+  | IMulHigh (_, lhs, rhs) ->
+    let lhs, rhs = canonical_binop A.Mul lhs rhs in
+    Some (EMulHigh (lhs, rhs))
   | IBitAnd (_, operand, mask) -> Some (EBitAnd (operand, mask))
   | _ -> None
 
@@ -236,9 +342,10 @@ let expr_of_instrs = function
   | _ -> None
 
 let expr_temps = function
-  | EUnary (_, operand) | EShift (operand, _) | EBitAnd (operand, _) ->
+  | EUnary (_, operand) | EShift (operand, _) | EBitAnd (operand, _)
+  | EShiftRightArith (operand, _) | EShiftRightLogic (operand, _) ->
     (match operand_temp operand with Some t -> IntSet.singleton t | None -> IntSet.empty)
-  | EBinary (_, lhs, rhs) ->
+  | EBinary (_, lhs, rhs) | EMulHigh (lhs, rhs) ->
     List.filter_map operand_temp [lhs; rhs]
     |> List.fold_left (fun set t -> IntSet.add t set) IntSet.empty
 
@@ -316,6 +423,18 @@ let local_pass body =
        | IBitAnd (dst, operand, mask) ->
          let operand = rewrite_operand env operand in
          keep_defining dst (apply_cse dst (simplify_bit_and dst operand mask) exprs)
+       | IShiftRightArith (dst, operand, amount) ->
+         let operand = rewrite_operand env operand in
+         keep_defining dst
+           (apply_cse dst (simplify_shift_right_arith dst operand amount) exprs)
+       | IShiftRightLogic (dst, operand, amount) ->
+         let operand = rewrite_operand env operand in
+         keep_defining dst
+           (apply_cse dst (simplify_shift_right_logic dst operand amount) exprs)
+       | IMulHigh (dst, lhs, rhs) ->
+         let lhs = rewrite_operand env lhs in
+         let rhs = rewrite_operand env rhs in
+         keep_defining dst (apply_cse dst (simplify_mul_high dst lhs rhs) exprs)
        | IStoreGlobal (name, operand) ->
          let operand = rewrite_operand env operand in
          loop env exprs true (IStoreGlobal (name, operand) :: acc) rest
@@ -506,6 +625,22 @@ let transfer_const env instr =
       (match lattice_of env operand with
        | LConst value -> LConst (value land mask)
        | other -> other)
+  | IShiftRightArith (dst, operand, amount) ->
+    define dst
+      (match lattice_of env operand with
+       | LConst value -> LConst (apply_shift_right_arith value amount)
+       | other -> other)
+  | IShiftRightLogic (dst, operand, amount) ->
+    define dst
+      (match lattice_of env operand with
+       | LConst value -> LConst (apply_shift_right_logic value amount)
+       | other -> other)
+  | IMulHigh (dst, lhs, rhs) ->
+    define dst
+      (match lattice_of env lhs, lattice_of env rhs with
+       | LConst a, LConst b -> LConst (apply_mul_high a b)
+       | LOverdef, _ | _, LOverdef -> LOverdef
+       | _ -> LUnknown)
   | ICall (Some dst, _, _) -> define dst LOverdef
   | ICall (None, _, _) | IStoreGlobal _ | ILabel _ | IJump _ | IBranchZero _
   | IBranchNonZero _ | IReturn _ -> env
@@ -587,6 +722,11 @@ let propagate_constants body =
       | IShiftLeft (dst, Imm value, amount) ->
         Some (ILoad (dst, Imm (apply_shift_left value amount)))
       | IBitAnd (dst, Imm value, mask) -> Some (ILoad (dst, Imm (value land mask)))
+      | IShiftRightArith (dst, Imm value, amount) ->
+        Some (ILoad (dst, Imm (apply_shift_right_arith value amount)))
+      | IShiftRightLogic (dst, Imm value, amount) ->
+        Some (ILoad (dst, Imm (apply_shift_right_logic value amount)))
+      | IMulHigh (dst, Imm a, Imm b) -> Some (ILoad (dst, Imm (apply_mul_high a b)))
       | IBranchZero (Imm 0, label) -> Some (IJump label)
       | IBranchZero (Imm _, _) -> None
       | IBranchNonZero (Imm 0, _) -> None
@@ -669,13 +809,17 @@ let retarget_dest dst = function
   | IUnaryOp (_, op, operand) -> IUnaryOp (dst, op, operand)
   | IBinOp (_, op, lhs, rhs) -> IBinOp (dst, op, lhs, rhs)
   | IShiftLeft (_, operand, amount) -> IShiftLeft (dst, operand, amount)
+  | IShiftRightArith (_, operand, amount) -> IShiftRightArith (dst, operand, amount)
+  | IShiftRightLogic (_, operand, amount) -> IShiftRightLogic (dst, operand, amount)
+  | IMulHigh (_, lhs, rhs) -> IMulHigh (dst, lhs, rhs)
   | IBitAnd (_, operand, mask) -> IBitAnd (dst, operand, mask)
   | ILoadGlobal (_, name) -> ILoadGlobal (dst, name)
   | ICall (Some _, name, args) -> ICall (Some dst, name, args)
   | instr -> instr
 
 let retargetable = function
-  | ILoad _ | IUnaryOp _ | IBinOp _ | IShiftLeft _ | IBitAnd _ | ILoadGlobal _
+  | ILoad _ | IUnaryOp _ | IBinOp _ | IShiftLeft _ | IShiftRightArith _
+  | IShiftRightLogic _ | IMulHigh _ | IBitAnd _ | ILoadGlobal _
   | ICall (Some _, _, _) -> true
   | _ -> false
 
@@ -705,7 +849,8 @@ let fold_assignment_temps body =
 (* Division on RISC-V never traps, so every pure computation below is safe to
    speculate into the preheader. *)
 let hoistable = function
-  | ILoad _ | IUnaryOp _ | IBinOp _ | IShiftLeft _ | IBitAnd _ -> true
+  | ILoad _ | IUnaryOp _ | IBinOp _ | IShiftLeft _ | IShiftRightArith _
+  | IShiftRightLogic _ | IMulHigh _ | IBitAnd _ -> true
   | ILoadParam _ | ILoadGlobal _ | IStoreGlobal _ | ICall _ | ILabel _
   | IJump _ | IBranchZero _ | IBranchNonZero _ | IReturn _ -> false
 
@@ -900,6 +1045,9 @@ let optimize_body body =
       |> rewrite_modulo_zero_tests
       |> fold_assignment_temps
       |> local_pass
+      (* After local_pass, so a divisor that only became constant through
+         propagation is still expanded. *)
+      |> expand_constant_division
       |> propagate_constants
       |> cleanup_control_flow
       |> global_cse
@@ -932,7 +1080,8 @@ let optimize_body body =
    ===================================================== *)
 
 let reexecutable_condition = function
-  | ILoad _ | IUnaryOp _ | IBinOp _ | IShiftLeft _ | IBitAnd _ | ILoadGlobal _ -> true
+  | ILoad _ | IUnaryOp _ | IBinOp _ | IShiftLeft _ | IShiftRightArith _
+  | IShiftRightLogic _ | IMulHigh _ | IBitAnd _ | ILoadGlobal _ -> true
   | ILoadParam _ | IStoreGlobal _ | ICall _ | ILabel _ | IJump _ | IBranchZero _
   | IBranchNonZero _ | IReturn _ -> false
 
@@ -1247,14 +1396,23 @@ let materialize_once body =
     in
     let rewritten =
       List.mapi (fun index instr ->
-        match instr with
-        | IBinOp (dst, op, lhs, rhs) when IntSet.mem index nodes ->
-          let in_branch = fused.(index) in
-          IBinOp
-            (dst, op,
-             lift ~in_branch op Target.Left lhs,
-             lift ~in_branch op Target.Right rhs)
-        | instr -> instr
+        if not (IntSet.mem index nodes) then instr
+        else
+          match instr with
+          | IBinOp (dst, op, lhs, rhs) ->
+            let in_branch = fused.(index) in
+            IBinOp
+              (dst, op,
+               lift ~in_branch op Target.Left lhs,
+               lift ~in_branch op Target.Right rhs)
+          (* mulh has no immediate form, so the reciprocal always costs an li
+             unless it is hoisted. *)
+          | IMulHigh (dst, lhs, rhs) ->
+            IMulHigh
+              (dst,
+               lift ~in_branch:true A.Mul Target.Left lhs,
+               lift ~in_branch:true A.Mul Target.Right rhs)
+          | instr -> instr
       ) body
     in
     if !wanted = [] then None

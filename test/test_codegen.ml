@@ -28,7 +28,71 @@ let distinct_homes message allocation a b =
   | Regalloc.Spill x, Regalloc.Spill y when x = y -> failwith message
   | _ -> ()
 
+(* Mirrors the sequence Optimize.quotient_instrs emits, step for step and with
+   the same 32-bit wrapping, so this checks the arithmetic the compiler will
+   actually run rather than a restatement of it. *)
+let quotient_model d n =
+  let magnitude = abs d in
+  if Target.is_power_of_two magnitude then begin
+    let amount = Target.log2 magnitude in
+    let sign = Ir.apply_shift_right_arith n 31 in
+    let bias = Ir.apply_shift_right_logic sign (32 - amount) in
+    let biased = Ir.i32 (n + bias) in
+    let magnitude_quotient = Ir.apply_shift_right_arith biased amount in
+    if d > 0 then Some magnitude_quotient else Some (Ir.apply_unary Ast.UMinus magnitude_quotient)
+  end
+  else
+    match Target.division_magic d with
+    | None -> None
+    | Some { Target.multiplier; shift } ->
+      let high = Ir.apply_mul_high multiplier n in
+      let high =
+        if d > 0 && multiplier < 0 then Ir.i32 (high + n)
+        else if d < 0 && multiplier > 0 then Ir.i32 (high - n)
+        else high
+      in
+      let high = if shift > 0 then Ir.apply_shift_right_arith high shift else high in
+      let sign = Ir.apply_shift_right_logic high 31 in
+      Some (Ir.i32 (high + sign))
+
+let true_quotient d n = Int32.(to_int (div (of_int n) (of_int d)))
+
 let () =
+  (* Division by a constant is replaced by a multiply-and-shift sequence, which
+     is only safe if it agrees with the divide instruction on every dividend.
+     Sweep the interesting ones: the boundaries, both signs, and a deterministic
+     spread in between. *)
+  let dividends =
+    let rec spread seed count acc =
+      if count = 0 then acc
+      else
+        (* Deterministic LCG, so a failure is always reproducible. *)
+        let seed = (seed * 1103515245) + 12345 in
+        spread seed (count - 1) (Ir.i32 seed :: acc)
+    in
+    [ Ir.min_i32; Ir.min_i32 + 1; -2000000000; -1000003; -65536; -12345; -256;
+      -7; -3; -2; -1; 0; 1; 2; 3; 7; 256; 12345; 65536; 1000003; 2000000000;
+      Ir.max_i32 - 1; Ir.max_i32 ]
+    @ spread 1 400 []
+  in
+  let checked = ref 0 in
+  for d = -300 to 300 do
+    if d <> 0 && d <> 1 && d <> -1 && d <> Ir.min_i32 then
+      List.iter (fun n ->
+        match quotient_model d n with
+        | None -> ()
+        | Some got ->
+          incr checked;
+          let want = true_quotient d n in
+          if got <> want then
+            failwith
+              (Printf.sprintf "constant division wrong: %d / %d gave %d, want %d"
+                 n d got want)
+      ) dividends
+  done;
+  if !checked < 100000 then
+    failwith (Printf.sprintf "division sweep only checked %d cases" !checked);
+
   (* A value used at a loop header stays live across the whole back edge.  A
      textual live-interval allocator would happily give temporaries 0 and 1 the
      same register, and the loop body would then clobber the next condition. *)

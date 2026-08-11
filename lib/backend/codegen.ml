@@ -258,6 +258,24 @@ let emit_shift_left ctx dst operand amount =
   let load, reg = operand_reg ctx "t0" operand in
   load @ emit_slli target reg amount @ store_result ctx target dst
 
+let emit_shift_right ctx mnemonic dst operand amount =
+  let target = result_reg ctx dst "t2" in
+  let load, reg = operand_reg ctx "t0" operand in
+  let code =
+    if amount = 0 then emit_mv target reg
+    else line "  %s %s, %s, %d" mnemonic target reg amount
+  in
+  load @ code @ store_result ctx target dst
+
+let emit_mul_high ctx dst lhs rhs =
+  let target = result_reg ctx dst "t2" in
+  let lhs_load, lhs_reg = operand_reg ctx "t0" lhs in
+  let rhs_load, rhs_reg = operand_reg ctx "t1" rhs in
+  lhs_load
+  @ rhs_load
+  @ line "  mulh %s, %s, %s" target lhs_reg rhs_reg
+  @ store_result ctx target dst
+
 let emit_bit_and ctx dst operand mask =
   let target = result_reg ctx dst "t2" in
   let load, reg = operand_reg ctx "t0" operand in
@@ -472,6 +490,11 @@ let emit_instr ctx ~framed = function
   | IUnaryOp (dst, op, operand) -> emit_unaryop ctx dst op operand
   | IBinOp (dst, op, lhs, rhs) -> emit_binop ctx dst op lhs rhs
   | IShiftLeft (dst, operand, amount) -> emit_shift_left ctx dst operand amount
+  | IShiftRightArith (dst, operand, amount) ->
+    emit_shift_right ctx "srai" dst operand amount
+  | IShiftRightLogic (dst, operand, amount) ->
+    emit_shift_right ctx "srli" dst operand amount
+  | IMulHigh (dst, lhs, rhs) -> emit_mul_high ctx dst lhs rhs
   | IBitAnd (dst, operand, mask) -> emit_bit_and ctx dst operand mask
   | ICall (dst, name, args) -> emit_call ctx dst name args
   | ILabel label -> line "%s:" label
