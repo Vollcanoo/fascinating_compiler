@@ -16,6 +16,7 @@ fascinating_compiler/
 │       ├── cfg.ml       # 指令级控制流图、支配关系、自然循环
 │       ├── liveness.ml  # 活跃变量分析
 │       ├── optimize.ml  # 优化流水线
+│       ├── scev.ml      # 标量演化：循环递推式的闭式解
 │       ├── target.ml    # RISC-V 立即数编码规则（优化器与后端共用）
 │       ├── regalloc.ml  # 图着色寄存器分配
 │       └── codegen.ml   # RISC-V32 指令选择与发射

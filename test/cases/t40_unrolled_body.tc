@@ -1,0 +1,51 @@
+// EXPECT: 65740
+// Unrolling replicates the body, so anything the body contains gets replicated
+// with it: the labels of an inner "if" have to be renamed per copy, and an
+// early exit has to keep leaving the loop from whichever copy it sits in.
+
+// Branches inside the body, and a break that can fire from any copy.
+int early_exit() {
+  int i = 0;
+  int s = 0;
+  while (i < 64) {
+    if (i % 3 == 0) {
+      s = s + i;
+    } else {
+      s = s - 1;
+    }
+    if (s > 300) {
+      break;
+    }
+    i = i + 1;
+  }
+  return s * 100 + i;
+}
+
+// A return from inside an unrolled body.
+int early_return() {
+  int i = 0;
+  int s = 0;
+  while (i < 32) {
+    s = s + i * i;
+    if (s > 500) {
+      return s * 10 + i;
+    }
+    i = i + 1;
+  }
+  return s;
+}
+
+// The counter survives the loop, so the copies cannot drop its update.
+int counter_survives() {
+  int i = 0;
+  int s = 0;
+  while (i < 24) {
+    s = s + i;
+    i = i + 1;
+  }
+  return s * 100 + i;
+}
+
+int main() {
+  return early_exit() + early_return() + counter_survives();
+}

@@ -1,0 +1,30 @@
+// EXPECT: 735729
+// A closed form has to reproduce the loop's arithmetic, including its
+// overflow. Both of these accumulate far past 2^31, so a closed form evaluated
+// over the integers rather than modulo 2^32 would disagree with the loop it
+// replaced.
+
+int cubes() {
+  int i = 0;
+  int s = 0;
+  while (i < 100000) {
+    s = s + i * i;
+    i = i + 1;
+  }
+  return s % 1000;
+}
+
+// Repeated overflow of a plain linear accumulator.
+int linear() {
+  int i = 0;
+  int s = 1;
+  while (i < 50000) {
+    s = s + 1000000;
+    i = i + 1;
+  }
+  return s % 997;
+}
+
+int main() {
+  return cubes() * 1000 + linear();
+}

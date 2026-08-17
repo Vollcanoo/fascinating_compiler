@@ -186,13 +186,52 @@ let () =
   fail_if (not (contains assembly "sw ")) "the global store was optimized away";
 
   (* A comparison that only feeds a branch is folded into the branch, so no
-     0/1 value should ever be materialised with slt. *)
+     0/1 value should ever be materialised with slt.  The bound is a global so
+     that the loop survives to be branched over at all: with a literal bound the
+     whole thing has a closed form and disappears. *)
   let assembly =
     compile ~opt:true
-      "int main() { int i = 0; int s = 0; while (i < 10) { s = s + i; i = i + 1; } return s; }"
+      ("int limit = 10; int main() { int i = 0; int s = 0; "
+       ^ "while (i < limit) { s = s + i; i = i + 1; } return s; }")
   in
   fail_if
     (not (contains assembly "blt" || contains assembly "bge"))
     "loop comparison was not folded into a branch";
   fail_if (contains assembly "  slt ")
-    "loop comparison was materialised as a value"
+    "loop comparison was materialised as a value";
+
+  (* Global promotion can turn a loop that writes a global into one that only
+     computes, at which point the closed form applies and the loop collapses to
+     its write-back.  The store itself still has to be there: what the memory
+     ends up holding is observable, only the intermediate values are not. *)
+  let assembly =
+    compile ~opt:true
+      ("int g = 0; int main() { int i = 0; int s = 0; "
+       ^ "while (i < 1000) { s = s + i; g = s; i = i + 1; } return s; }")
+  in
+  fail_if (not (contains assembly "la t1, g")) "closed-form rewrite dropped a global store";
+  fail_if (not (contains assembly "sw ")) "closed-form rewrite dropped a global store";
+
+  (* A call is not a value the analysis can evolve, so a loop containing one
+     keeps running however arithmetic the rest of its body looks. *)
+  let assembly =
+    compile ~opt:true
+      ("int fact(int n) { if (n <= 1) return 1; return n * fact(n - 1); } "
+       ^ "int main() { int i = 1; int s = 0; "
+       ^ "while (i < 100) { s = s + fact(i); i = i + 1; } return s; }")
+  in
+  fail_if (not (contains assembly "call fact")) "the call was optimized away";
+  fail_if
+    (not (contains assembly "blt" || contains assembly "bge"))
+    "closed-form rewrite deleted a loop containing a call";
+
+  (* An unrolled body still runs the loop; the counter just advances by the
+     whole factor between tests. *)
+  let assembly =
+    compile ~opt:true
+      ("int g = 0; int main() { int i = 0; "
+       ^ "while (i < 4000) { g = g + i; i = i + 1; } return g; }")
+  in
+  fail_if
+    (not (contains assembly "blt" || contains assembly "bge"))
+    "unrolled loop lost its back branch"

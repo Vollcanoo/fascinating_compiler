@@ -1,0 +1,55 @@
+// EXPECT: 828500
+// Accumulators whose per-iteration increment is itself affine in the counter
+// have a closed form one degree higher. Each of these exercises a different
+// corner of deriving it: the trip count, the degree, a step other than one,
+// and a counter that runs downwards.
+
+// s grows by i, so s is quadratic in the iteration index.
+int triangle() {
+  int i = 0;
+  int s = 0;
+  while (i < 1000) {
+    s = s + i;
+    i = i + 1;
+  }
+  return s;
+}
+
+// s grows by i * i, so s is cubic. The increment has to be multiplied out
+// before it can be accumulated.
+int squares() {
+  int i = 0;
+  int s = 0;
+  while (i < 100) {
+    s = s + i * i;
+    i = i + 1;
+  }
+  return s;
+}
+
+// The counter neither starts at zero nor steps by one, and the bound is not a
+// multiple of the step: the loop stops at 47, not at 49.
+int stepped() {
+  int i = 3;
+  int s = 7;
+  while (i < 50) {
+    s = s + 2 * i - 1;
+    i = i + 4;
+  }
+  return s;
+}
+
+// A descending counter tested with ">".
+int countdown() {
+  int i = 10;
+  int s = 0;
+  while (i > 0) {
+    s = s + i;
+    i = i - 1;
+  }
+  return s;
+}
+
+int main() {
+  return triangle() + squares() + stepped() + countdown();
+}

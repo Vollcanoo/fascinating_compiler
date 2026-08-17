@@ -1,0 +1,45 @@
+// EXPECT: 5200504
+// A trip count is derived from the value the counter starts at, so it is only
+// valid if the loop really is entered with that value every time. The two
+// nests below differ by one line -- where the inner counter is declared -- and
+// that line changes the answer.
+
+// The inner counter is reset inside the outer body, so every entry to the
+// inner loop starts from zero and it runs four times per outer iteration.
+int reset_each_time() {
+  int i = 0;
+  int total = 0;
+  while (i < 5) {
+    int j = 0;
+    while (j < 4) {
+      total = total + 1;
+      j = j + 1;
+    }
+    total = total + 100;
+    i = i + 1;
+  }
+  return total;
+}
+
+// The inner counter lives outside the outer loop. It reaches four during the
+// first outer iteration and stays there, so the inner body runs on that pass
+// only -- a closed form derived from "j starts at zero" would count it five
+// times over.
+int carried_across() {
+  int i = 0;
+  int total = 0;
+  int j = 0;
+  while (i < 5) {
+    while (j < 4) {
+      total = total + 1;
+      j = j + 1;
+    }
+    total = total + 100;
+    i = i + 1;
+  }
+  return total;
+}
+
+int main() {
+  return reset_each_time() * 10000 + carried_across();
+}

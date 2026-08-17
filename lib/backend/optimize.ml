@@ -1,10 +1,17 @@
 (** Optimization pipeline for the ToyC IR.
 
     Everything here is a static program transformation driven by the AST, the
-    IR and control/data-flow facts.  Constants are only evaluated when every
-    operand has been *proven* constant; calls, loops and side effecting
-    operations are never executed at compile time, so [-opt] cannot degenerate
-    into "precompute main and return a literal".
+    IR and control/data-flow facts.  The compiler never runs the program it is
+    compiling: constants are only evaluated when every operand has been *proven*
+    constant, and calls and side effecting operations are never folded.
+
+    Loops are the one case worth spelling out.  A loop whose body is pure
+    straight-line arithmetic is replaced by the closed form of its recurrences
+    (see [closed_form_loops] and [Scev]), which is symbolic algebra on the shape
+    of the recurrence rather than a replay of it -- the work is proportional to
+    the degree of the polynomial, not to the trip count.  A [main] built only
+    out of such loops therefore does fold to a literal.  A body containing a
+    call, a global store or control flow of its own does not qualify.
 
     Pass order (per function, run to a fixpoint):
 
@@ -13,11 +20,14 @@
                              strength reduction and local CSE
       propagate_constants    CFG-wide constant propagation with reachability
       cleanup_control_flow   redundant jumps, unreachable code, unused labels
+      closed_form_loops      scalar evolution; counted loops with a pure body
       global_cse             available expressions across blocks
       licm                   loop-invariant code motion
       eliminate_dead_defs    liveness-driven dead definition removal
       eliminate_dead_stores  redundant global stores
       cleanup_control_flow
+
+    Then once, after the fixpoint has settled: unroll_loops.
 
     Around that, per program: loop rotation, small-function inlining,
     tail-recursion to loop rewriting and unreachable function removal. *)
@@ -1292,6 +1302,667 @@ let promote_loop_globals body =
   fix body
 
 (* =====================================================
+   Counted loop regions
+
+   The two transformations below ask the same three questions of a loop: does it
+   occupy one contiguous run of the instruction list, how many times does its
+   body run, and is the counter guaranteed to start from the same value every
+   time control enters the loop.
+
+   The third one is the subtle one and the only one that can silently produce
+   wrong code.  A trip count derived from "i starts at 0" is worthless if the
+   loop can be re-entered with i already at its ceiling -- which is exactly the
+   shape a nested loop takes when the inner counter is initialised outside the
+   outer body rather than inside it.
+   ===================================================== *)
+
+type loop_region = {
+  region_start : int;  (* the header label *)
+  region_stop : int;   (* the branch at the bottom that goes back to it *)
+  region_label : string;
+  region_cond : int;   (* the temporary that branch tests *)
+}
+
+let branch_target = function
+  | IJump target | IBranchZero (_, target) | IBranchNonZero (_, target) -> Some target
+  | _ -> None
+
+let label_references instrs label =
+  let refs = ref [] in
+  Array.iteri (fun index instr ->
+    if branch_target instr = Some label then refs := index :: !refs) instrs;
+  !refs
+
+let label_indices instrs =
+  let map = ref StringMap.empty in
+  Array.iteri (fun index instr ->
+    match instr with
+    | ILabel label -> map := StringMap.add label index !map
+    | _ -> ()) instrs;
+  !map
+
+(* A bottom-tested loop laid out as
+
+     h:  ILabel header
+         <body>
+     l:  branch-nonzero -> header
+
+   qualifies when nothing but [l] mentions the header label, nothing outside
+   [h, l] jumps into the middle, and nothing inside jumps to a label above [h].
+   That last clause is what keeps a "continue" -- which targets the condition
+   block sitting above the body -- from being treated as an ordinary iteration:
+   it re-enters the body without passing the bottom test. *)
+let contiguous_loops instrs =
+  let labels = label_indices instrs in
+  let regions = ref [] in
+  Array.iteri (fun header instr ->
+    match instr with
+    | ILabel label ->
+      (match label_references instrs label with
+       | [latch] when latch > header ->
+         (match instrs.(latch) with
+          | IBranchNonZero (Temp cond, _) ->
+            let inside index = index > header && index <= latch in
+            let ok = ref true in
+            for index = header + 1 to latch - 1 do
+              (match instrs.(index) with
+               | ILabel inner ->
+                 List.iter
+                   (fun reference -> if not (inside reference) then ok := false)
+                   (label_references instrs inner)
+               | _ -> ());
+              match branch_target instrs.(index) with
+              | None -> ()
+              | Some target ->
+                (match StringMap.find_opt target labels with
+                 | Some index when index > header -> ()
+                 | _ -> ok := false)
+            done;
+            if !ok then
+              regions :=
+                { region_start = header; region_stop = latch; region_label = label;
+                  region_cond = cond }
+                :: !regions
+          | _ -> ())
+       | _ -> ())
+    | _ -> ()) instrs;
+  List.rev !regions
+
+let region_has_inner_backedge instrs region =
+  let labels = label_indices instrs in
+  let found = ref false in
+  for index = region.region_start + 1 to region.region_stop - 1 do
+    match branch_target instrs.(index) with
+    | Some target ->
+      (match StringMap.find_opt target labels with
+       | Some target_index when target_index <= index -> found := true
+       | _ -> ())
+    | None -> ()
+  done;
+  !found
+
+let region_defs instrs region t =
+  let acc = ref [] in
+  for index = region.region_stop downto region.region_start do
+    if instr_dest instrs.(index) = Some t then acc := index :: !acc
+  done;
+  !acc
+
+let outside_defs instrs region t =
+  let acc = ref [] in
+  Array.iteri (fun index instr ->
+    if (index < region.region_start || index > region.region_stop)
+       && instr_dest instr = Some t
+    then acc := index :: !acc) instrs;
+  !acc
+
+(* The value [t] holds on every entry to the loop, or None when that is not a
+   single constant.  Every definition outside the loop has to agree, one of them
+   has to dominate the header, and -- the part dominance alone does not give --
+   there must be no way back to the header that skips them all.  The back edge
+   is excluded from that search: reaching the header along it is the loop, not a
+   re-entry. *)
+let entry_value instrs (cfg : Cfg.t) doms region t =
+  let defs = outside_defs instrs region t in
+  let agreed =
+    List.fold_left (fun acc index ->
+      match acc, instrs.(index) with
+      | None, _ -> None
+      | Some None, ILoad (_, Imm value) -> Some (Some value)
+      | Some (Some previous), ILoad (_, Imm value) when previous = value ->
+        Some (Some value)
+      | _ -> None) (Some None) defs
+  in
+  match agreed with
+  | Some (Some value)
+    when List.exists (fun d -> Cfg.dominates doms d region.region_start) defs ->
+    let masked =
+      List.fold_left (fun set d -> IntSet.add d set) IntSet.empty defs
+    in
+    let count = Array.length instrs in
+    let seen = Array.make count false in
+    let reenters = ref false in
+    let rec visit = function
+      | [] -> ()
+      | index :: rest ->
+        if index = region.region_start then begin
+          reenters := true;
+          visit rest
+        end
+        else if index < 0 || index >= count || seen.(index) || IntSet.mem index masked
+        then visit rest
+        else begin
+          seen.(index) <- true;
+          let succs =
+            if index = region.region_stop then
+              List.filter (fun s -> s <> region.region_start) cfg.succs.(index)
+            else cfg.succs.(index)
+          in
+          visit (succs @ rest)
+        end
+    in
+    visit cfg.succs.(region.region_start);
+    if !reenters then None else Some value
+  | _ -> None
+
+(* How many times the body runs.  The loop is bottom-tested, so the answer is
+   never zero once control reaches the header.
+
+   The counter must be provably free of overflow.  A closed form is exact modulo
+   2^32, but the *number of iterations* is not a modular quantity: a counter
+   that wraps past its ceiling runs a different number of times than the
+   arithmetic here predicts, so the last value it takes has to stay in range. *)
+let trip_count ~init ~step ~op ~bound =
+  let continues value =
+    match (op : A.bin_op) with
+    | A.Lt -> value < bound
+    | A.Le -> value <= bound
+    | A.Gt -> value > bound
+    | A.Ge -> value >= bound
+    | A.Ne -> value <> bound
+    | _ -> false
+  in
+  let monotone =
+    match (op : A.bin_op) with
+    | A.Lt | A.Le -> step > 0
+    | A.Gt | A.Ge -> step < 0
+    | A.Ne -> step <> 0
+    | _ -> false
+  in
+  if not monotone then None
+  else begin
+    let ceiling_of_divide distance stride =
+      if distance <= 0 then 1 else (distance + stride - 1) / stride
+    in
+    let count =
+      match (op : A.bin_op) with
+      | A.Lt -> ceiling_of_divide (bound - init) step
+      | A.Le -> ceiling_of_divide (bound + 1 - init) step
+      | A.Gt -> ceiling_of_divide (init - bound) (-step)
+      | A.Ge -> ceiling_of_divide (init - bound + 1) (-step)
+      | A.Ne ->
+        let distance = bound - init in
+        if distance = 0 || distance mod step <> 0 || distance / step < 1 then 0
+        else distance / step
+      | _ -> 0
+    in
+    let count = max count 1 in
+    if count > max_i32 then None
+    else
+      let last = init + (count * step) in
+      (* Two independent checks that the answer really is the first exit: the
+         loop must stop at [count], and must not have stopped before it. *)
+      if last > max_i32 || last < min_i32 then None
+      else if continues last then None
+      else if count > 1 && not (continues (init + ((count - 1) * step))) then None
+      else Some count
+  end
+
+(* Everything that is live on some edge leaving the region.  Reading liveness at
+   the instruction after the loop is not enough: a "break" leaves from the
+   middle, and once redundant jumps have been threaded its target need not be
+   the instruction the loop falls through to. *)
+let region_exit_live (cfg : Cfg.t) (live : Liveness.t) region =
+  let acc = ref IntSet.empty in
+  for index = region.region_start to region.region_stop do
+    List.iter (fun succ ->
+      if succ < region.region_start || succ > region.region_stop then
+        acc := IntSet.union !acc live.Liveness.live_in.(succ))
+      cfg.succs.(index)
+  done;
+  !acc
+
+type counted = {
+  cr_counter : int;
+  cr_init : int;
+  cr_step : int;
+  cr_trips : int;
+  cr_update : int;
+  cr_test : int;
+}
+
+let counted_region instrs (cfg : Cfg.t) doms region =
+  let single_def t =
+    match region_defs instrs region t with
+    | [definition] -> Some definition
+    | _ -> None
+  in
+  match single_def region.region_cond with
+  | None -> None
+  | Some test ->
+    (match instrs.(test) with
+     | IBinOp (_, op, Temp counter, Imm bound) ->
+       (* The test has to read the counter after the update, which is the shape
+          loop rotation leaves behind. *)
+       (match single_def counter with
+        | Some update when update < test ->
+          (match instrs.(update) with
+           | IBinOp (_, A.Add, Temp base, Imm step) when base = counter ->
+             (match entry_value instrs cfg doms region counter with
+              | None -> None
+              | Some init ->
+                (match trip_count ~init ~step ~op ~bound with
+                 | None -> None
+                 | Some trips ->
+                   Some
+                     { cr_counter = counter; cr_init = init; cr_step = step;
+                       cr_trips = trips; cr_update = update; cr_test = test }))
+           | _ -> None)
+        | _ -> None)
+     | _ -> None)
+
+(* =====================================================
+   Closed-form loop evaluation
+
+   A loop whose body is straight-line arithmetic computes, for each value it
+   carries, a polynomial in the iteration index.  Scalar evolution derives that
+   polynomial from the *shape* of the recurrence -- "s grows by i on every
+   iteration" is turned into a degree-two chain without the loop being run --
+   and the trip count then says where to read it off.
+
+   This is the one place where a loop disappears entirely, so the preconditions
+   are deliberately narrow: the body must be pure (no calls, no globals, no
+   control flow of its own), so deleting it cannot drop an observable effect;
+   every value that outlives the loop must have a closed form, so nothing is
+   left undefined; and the derived recurrence is checked against a second
+   symbolic pass before anything is rewritten.
+   ===================================================== *)
+
+type evolution =
+  | Unknown
+  | Known of Scev.t
+
+let pure_computation = function
+  | ILoad _ | IUnaryOp _ | IBinOp _ | IShiftLeft _ | IShiftRightArith _
+  | IShiftRightLogic _ | IMulHigh _ | IBitAnd _ -> true
+  | ILoadParam _ | ILoadGlobal _ | IStoreGlobal _ | ICall _ | ILabel _ | IJump _
+  | IBranchZero _ | IBranchNonZero _ | IReturn _ -> false
+
+(* One step of symbolic execution.  Addition, subtraction, multiplication and a
+   shift by a constant stay inside the polynomial world; everything else only
+   folds when its operands have collapsed to constants, which is the same rule
+   the rest of the optimizer follows. *)
+let evolve value_of instr =
+  let operand = function
+    | Imm value -> Known (Scev.const value)
+    | Temp t -> value_of t
+  in
+  let lift1 o f =
+    match operand o with
+    | Known p -> f p
+    | Unknown -> Unknown
+  in
+  let lift2 a b f =
+    match operand a, operand b with
+    | Known p, Known q -> f p q
+    | _ -> Unknown
+  in
+  let folded1 o f =
+    lift1 o (fun p ->
+      match Scev.const_value p with
+      | Some value -> Known (Scev.const (f value))
+      | None -> Unknown)
+  in
+  let folded2 a b f =
+    lift2 a b (fun p q ->
+      match Scev.const_value p, Scev.const_value q with
+      | Some x, Some y -> (match f x y with Some v -> Known (Scev.const v) | None -> Unknown)
+      | _ -> Unknown)
+  in
+  match instr with
+  | ILoad (_, o) -> operand o
+  | IUnaryOp (_, A.UPlus, o) -> operand o
+  | IUnaryOp (_, A.UMinus, o) -> lift1 o (fun p -> Known (Scev.neg p))
+  | IUnaryOp (_, A.Not, o) -> folded1 o (apply_unary A.Not)
+  | IBinOp (_, A.Add, a, b) -> lift2 a b (fun p q -> Known (Scev.add p q))
+  | IBinOp (_, A.Sub, a, b) -> lift2 a b (fun p q -> Known (Scev.sub p q))
+  | IBinOp (_, A.Mul, a, b) ->
+    lift2 a b (fun p q ->
+      match Scev.mul p q with Some r -> Known r | None -> Unknown)
+  | IBinOp (_, op, a, b) -> folded2 a b (apply_binary op)
+  | IShiftLeft (_, o, amount) when amount >= 0 && amount < 32 ->
+    lift1 o (fun p -> Known (Scev.scale p (1 lsl amount)))
+  | IShiftRightArith (_, o, amount) -> folded1 o (fun v -> apply_shift_right_arith v amount)
+  | IShiftRightLogic (_, o, amount) -> folded1 o (fun v -> apply_shift_right_logic v amount)
+  | IBitAnd (_, o, m) -> folded1 o (fun v -> v land m)
+  | IMulHigh (_, a, b) -> folded2 a b (fun x y -> Some (apply_mul_high x y))
+  | _ -> Unknown
+
+let closed_form_region instrs (cfg : Cfg.t) doms (live : Liveness.t) region =
+  let h = region.region_start and l = region.region_stop in
+  let straight_line = ref (l > h + 1) in
+  for index = h + 1 to l - 1 do
+    if not (pure_computation instrs.(index)) then straight_line := false
+  done;
+  if not !straight_line then None
+  else
+    match counted_region instrs cfg doms region with
+    | None -> None
+    | Some counted ->
+      let defined = ref IntSet.empty in
+      for index = h + 1 to l - 1 do
+        match instr_dest instrs.(index) with
+        | Some dst -> defined := IntSet.add dst !defined
+        | None -> ()
+      done;
+      let defined = !defined in
+      (* Values that reach the header from a previous iteration are the ones
+         that need a recurrence solved; anything else is written before it is
+         read and only needs forward evaluation. *)
+      let carried = IntSet.inter defined live.Liveness.live_in.(h) in
+      let invariants =
+        let acc = ref IntMap.empty in
+        for index = h + 1 to l - 1 do
+          List.iter (fun o ->
+            match operand_temp o with
+            | Some t when (not (IntSet.mem t defined)) && not (IntMap.mem t !acc) ->
+              let value =
+                match entry_value instrs cfg doms region t with
+                | Some v -> Known (Scev.const v)
+                | None -> Unknown
+              in
+              acc := IntMap.add t value !acc
+            | _ -> ()) (instr_operands instrs.(index))
+        done;
+        !acc
+      in
+      let resolved = ref IntMap.empty in
+      (* One symbolic sweep of the body; returns what was known just before each
+         instruction, and what everything evaluates to at the end. *)
+      let sweep () =
+        let env =
+          ref
+            (IntSet.fold (fun t acc ->
+               IntMap.add t
+                 (match IntMap.find_opt t !resolved with
+                  | Some p -> Known p
+                  | None -> Unknown)
+                 acc) defined invariants)
+        in
+        let before = Hashtbl.create 16 in
+        for index = h + 1 to l - 1 do
+          Hashtbl.replace before index !env;
+          let value =
+            evolve
+              (fun t -> Option.value (IntMap.find_opt t !env) ~default:Unknown)
+              instrs.(index)
+          in
+          match instr_dest instrs.(index) with
+          | Some dst -> env := IntMap.add dst value !env
+          | None -> ()
+        done;
+        (before, !env)
+      in
+      let progress = ref true in
+      while !progress do
+        progress := false;
+        let before, _ = sweep () in
+        IntSet.iter (fun t ->
+          if not (IntMap.mem t !resolved) then
+            match region_defs instrs region t with
+            | [definition] ->
+              let env = Hashtbl.find before definition in
+              let known = function
+                | Imm value -> Some (Scev.const value)
+                | Temp u ->
+                  (match IntMap.find_opt u env with
+                   | Some (Known p) -> Some p
+                   | _ -> None)
+              in
+              let increment =
+                match instrs.(definition) with
+                | IBinOp (_, A.Add, Temp a, o) when a = t -> known o
+                | IBinOp (_, A.Add, o, Temp a) when a = t -> known o
+                | IBinOp (_, A.Sub, Temp a, o) when a = t ->
+                  Option.map Scev.neg (known o)
+                | _ -> None
+              in
+              (match increment, entry_value instrs cfg doms region t with
+               | Some step, Some init ->
+                 (match Scev.antidifference init step with
+                  | Some closed ->
+                    resolved := IntMap.add t closed !resolved;
+                    progress := true
+                  | None -> ())
+               | _ -> ())
+            | _ -> ()) carried
+      done;
+      let _, final = sweep () in
+      (* Independent check that each solved recurrence actually reproduces
+         itself: the value at the end of iteration n has to be the header value
+         at n + 1. *)
+      let consistent =
+        IntMap.for_all (fun t closed ->
+          match IntMap.find_opt t final with
+          | Some (Known reached) -> Scev.equal reached (Scev.shift closed)
+          | _ -> false) !resolved
+      in
+      if not consistent then None
+      else begin
+        let needed = IntSet.inter defined (region_exit_live cfg live region) in
+        let last = counted.cr_trips - 1 in
+        let replacement =
+          IntSet.fold (fun t acc ->
+            match acc, IntMap.find_opt t final with
+            | None, _ -> None
+            | Some instrs_acc, Some (Known closed) ->
+              Some (ILoad (t, Imm (Scev.eval closed last)) :: instrs_acc)
+            | _ -> None) needed (Some [])
+        in
+        replacement
+      end
+
+let closed_form_loops body =
+  let rec attempt body =
+    let instrs = Array.of_list body in
+    let cfg = Cfg.build body in
+    let doms = Cfg.dominators cfg in
+    let live = Liveness.analyze cfg in
+    let rewritten =
+      List.find_map (fun region ->
+        match closed_form_region instrs cfg doms live region with
+        | Some replacement -> Some (region, replacement)
+        | None -> None) (contiguous_loops instrs)
+    in
+    match rewritten with
+    | None -> body
+    | Some (region, replacement) ->
+      let count = Array.length instrs in
+      let before = Array.to_list (Array.sub instrs 0 region.region_start) in
+      let after =
+        Array.to_list
+          (Array.sub instrs (region.region_stop + 1) (count - region.region_stop - 1))
+      in
+      attempt (before @ replacement @ after)
+  in
+  attempt body
+
+(* =====================================================
+   Counted loop unrolling
+
+   Every iteration of a tight loop pays for the bottom test and the branch back.
+   Running the body several times per test amortises that away, and because the
+   copies reuse the same temporaries it costs nothing in register pressure --
+   the live ranges get longer, but no new values appear.
+
+   The unroll factor has to divide the trip count exactly.  Dropping the
+   intermediate tests means the loop can only exit at a multiple of the factor,
+   so a factor that does not divide the trip count would overshoot.  Exits from
+   inside the body (a "break", a "return") are unaffected: they leave the loop
+   early either way.
+   ===================================================== *)
+
+let unroll_factors = [8; 4; 2]
+let unroll_limit = 96
+let unroll_peel_limit = 160
+
+let rename_labels mapping instr =
+  let target label = Option.value (StringMap.find_opt label mapping) ~default:label in
+  match instr with
+  | ILabel label -> ILabel (target label)
+  | IJump label -> IJump (target label)
+  | IBranchZero (o, label) -> IBranchZero (o, target label)
+  | IBranchNonZero (o, label) -> IBranchNonZero (o, target label)
+  | other -> other
+
+let unroll_loops body =
+  let unrolled = ref StringSet.empty in
+  let rec attempt body =
+    let instrs = Array.of_list body in
+    let cfg = Cfg.build body in
+    let doms = Cfg.dominators cfg in
+    let live = Liveness.analyze cfg in
+    let used = ref (labels_in_body body) in
+    let fresh base =
+      let rec pick n =
+        let candidate = base ^ "_u" ^ string_of_int n in
+        if StringSet.mem candidate !used then pick (n + 1)
+        else begin
+          used := StringSet.add candidate !used;
+          candidate
+        end
+      in
+      pick 0
+    in
+    let plan region =
+      if StringSet.mem region.region_label !unrolled then None
+      else if region_has_inner_backedge instrs region then None
+      else
+        match counted_region instrs cfg doms region with
+        | None -> None
+        | Some counted ->
+          let h = region.region_start and l = region.region_stop in
+          let size = l - h - 1 in
+          (* The factor has to divide the trip count, so whatever it leaves over
+             is peeled off in front of the loop.  Peeling is only worth its code
+             size when nothing divides exactly, hence the two-stage choice. *)
+          let usable factor =
+            factor * size <= unroll_limit
+            && counted.cr_trips >= factor
+            && abs (counted.cr_step * factor) <= max_i32
+          in
+          let choice =
+            match
+              List.find_opt
+                (fun factor -> usable factor && counted.cr_trips mod factor = 0)
+                unroll_factors
+            with
+            | Some factor -> Some (factor, 0)
+            | None ->
+              List.find_map (fun factor ->
+                let remainder = counted.cr_trips mod factor in
+                if usable factor
+                   && counted.cr_trips - remainder >= factor
+                   && (factor + remainder) * size <= unroll_peel_limit
+                then Some (factor, remainder)
+                else None) unroll_factors
+          in
+          if size <= 0 then None
+          else
+            (match choice with
+             | None -> None
+             | Some (factor, remainder) ->
+               let live_after = region_exit_live cfg live region in
+               (* The counter only has to be carried between copies when
+                  something other than the update and the test can observe it.
+                  When nothing can, the copies drop both and the last one steps
+                  by the whole factor at once. *)
+               let counter_uses = ref 0 in
+               for index = h + 1 to l - 1 do
+                 List.iter (fun o ->
+                   if o = Temp counted.cr_counter then incr counter_uses)
+                   (instr_operands instrs.(index))
+               done;
+               let fuse =
+                 !counter_uses = 2
+                 && (not (IntSet.mem counted.cr_counter live_after))
+                 && not (IntSet.mem region.region_cond live_after)
+               in
+               let inner = Array.sub instrs (h + 1) size in
+               let copy last =
+                 let keep index =
+                   last
+                   || (not fuse)
+                   || (index + h + 1 <> counted.cr_update
+                       && index + h + 1 <> counted.cr_test)
+                 in
+                 let step index instr =
+                   if fuse && last && index + h + 1 = counted.cr_update then
+                     IBinOp (counted.cr_counter, A.Add, Temp counted.cr_counter,
+                             Imm (counted.cr_step * factor))
+                   else instr
+                 in
+                 let selected =
+                   Array.to_list (Array.mapi (fun index instr ->
+                     if keep index then Some (step index instr) else None) inner)
+                   |> List.filter_map Fun.id
+                 in
+                 if last then selected
+                 else begin
+                   let mapping =
+                     List.fold_left (fun acc instr ->
+                       match instr with
+                       | ILabel label -> StringMap.add label (fresh label) acc
+                       | _ -> acc) StringMap.empty selected
+                   in
+                   List.map (rename_labels mapping) selected
+                 end
+               in
+               (* The peeled iterations run before the loop is entered, so when
+                  the copies have dropped the counter update the peeled ones owe
+                  it the distance they covered. *)
+               let peeled =
+                 List.concat (List.init remainder (fun _ -> copy false))
+                 @ (if fuse && remainder > 0 then
+                      [IBinOp (counted.cr_counter, A.Add, Temp counted.cr_counter,
+                               Imm (counted.cr_step * remainder))]
+                    else [])
+               in
+               let copies =
+                 List.concat (List.init (factor - 1) (fun _ -> copy false))
+                 @ copy true
+               in
+               unrolled := StringSet.add region.region_label !unrolled;
+               Some
+                 (region,
+                  peeled
+                  @ (ILabel region.region_label :: copies)
+                  @ [instrs.(l)]))
+    in
+    match List.find_map plan (contiguous_loops instrs) with
+    | None -> body
+    | Some (region, replacement) ->
+      let count = Array.length instrs in
+      let before = Array.to_list (Array.sub instrs 0 region.region_start) in
+      let after =
+        Array.to_list
+          (Array.sub instrs (region.region_stop + 1) (count - region.region_stop - 1))
+      in
+      attempt (before @ replacement @ after)
+  in
+  attempt body
+
+(* =====================================================
    Per-function fixpoint
    ===================================================== *)
 
@@ -1310,6 +1981,10 @@ let optimize_body body =
       |> expand_constant_division
       |> propagate_constants
       |> cleanup_control_flow
+      (* Inside the fixpoint so that collapsing an inner loop can expose the one
+         around it, whose body only becomes straight-line once the inner loop is
+         gone. *)
+      |> closed_form_loops
       |> global_cse
       |> licm
       |> promote_loop_globals
@@ -1814,6 +2489,12 @@ let run (program : program) : program =
     |> List.map (fun func ->
       let body =
         func.body
+        (* Unrolling runs once, after the fixpoint has finished shrinking the
+           body -- the decision to unroll depends on how big that body ended up,
+           and re-running the fixpoint afterwards is what removes the now-dead
+           copies of the loop test. *)
+        |> unroll_loops
+        |> optimize_body
         |> materialize_loop_constants
         |> licm
         |> eliminate_dead_defs

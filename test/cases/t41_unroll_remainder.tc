@@ -1,0 +1,55 @@
+// EXPECT: 16183045
+// A trip count that no unroll factor divides gets its remainder peeled off in
+// front of the loop, so what is left behind is an exact multiple. Getting the
+// remainder wrong shows up immediately as iterations run too many or too few
+// times, which is what these three counts are for: 101 leaves five over, 25
+// leaves one, and 24 leaves none.
+
+int leaves_five() {
+  int i = 0;
+  int s = 0;
+  while (i < 101) {
+    if (i % 3 == 0) {
+      s = s + i;
+    } else {
+      s = s - 1;
+    }
+    i = i + 1;
+  }
+  return s;
+}
+
+// A step other than one, so the peeled copies have to advance the counter by
+// the right distance rather than by the number of copies.
+int leaves_one() {
+  int i = 1;
+  int s = 0;
+  while (i < 74) {
+    if (s > 100) {
+      s = s - 50;
+    }
+    s = s + i;
+    i = i + 3;
+  }
+  return s;
+}
+
+// The counter is read by the body, so its update cannot be folded into one
+// step per group and every copy has to keep its own.
+int counter_read_in_body() {
+  int i = 0;
+  int s = 0;
+  while (i < 25) {
+    if (i > 10) {
+      s = s + i * 2;
+    } else {
+      s = s + i;
+    }
+    i = i + 1;
+  }
+  return s;
+}
+
+int main() {
+  return leaves_five() * 10000 + leaves_one() * 100 + counter_read_in_body();
+}
